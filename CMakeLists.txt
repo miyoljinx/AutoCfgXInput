@@ -4,9 +4,6 @@ project(BassBoosterPlugin CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Build MinHook as a static library
-set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
-
 # Fetch MinHook from GitHub
 include(FetchContent)
 FetchContent_Declare(
@@ -16,7 +13,14 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(minhook)
 
-add_library(BassBooster SHARED bass_booster.cpp)
+# Collect MinHook source files directly
+file(GLOB MINHOOK_SOURCES
+    "${minhook_SOURCE_DIR}/src/*.c"
+    "${minhook_SOURCE_DIR}/src/hde/*.c"
+)
+
+# Build BassBooster together with MinHook sources directly
+add_library(BassBooster SHARED bass_booster.cpp ${MINHOOK_SOURCES})
 
 set_target_properties(BassBooster PROPERTIES
     PREFIX ""
@@ -24,9 +28,15 @@ set_target_properties(BassBooster PROPERTIES
     OUTPUT_NAME "BassBooster"
 )
 
-# Link the minhook static target and winmm
-target_include_directories(BassBooster PRIVATE ${minhook_SOURCE_DIR}/include)
-target_link_libraries(BassBooster PRIVATE minhook winmm)
+# Include MinHook headers
+target_include_directories(BassBooster PRIVATE 
+    ${minhook_SOURCE_DIR}/include
+    ${minhook_SOURCE_DIR}/src
+    ${minhook_SOURCE_DIR}/src/hde
+)
 
-# Statically link C/C++ runtimes to prevent missing runtime DLL errors in Wine
+# Link Windows Multimedia system library
+target_link_libraries(BassBooster PRIVATE winmm)
+
+# Statically link runtime dependencies to avoid ERROR_MOD_NOT_FOUND (126) in Wine
 target_link_options(BassBooster PRIVATE -static -static-libgcc -static-libstdc++)

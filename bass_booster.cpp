@@ -1,17 +1,20 @@
 #include <windows.h>
-#include <dsound.h>
+#include <mmeapi.h>
+#include <audioclient.h>
 #include <cmath>
 #include <fstream>
 #include <string>
 #include "MinHook.h"
 
+// Configuration Parameters
 struct Config {
     bool enabled = true;
     float bassGainDb = 10.0f;
     float cutoffFreq = 100.0f;
-    float masterVolume = 0.2f; // Low volume for instant audio test
+    float masterVolume = 0.2f; // Default 20% for hearing test
 } g_config;
 
+// BiQuad Low-Shelf Equalizer Filter
 struct BiquadFilter {
     float b0, b1, b2, a1, a2;
     float x1[2] = {0}, x2[2] = {0};
@@ -31,7 +34,7 @@ struct BiquadFilter {
         float a0 = (A + 1.0f) + (A - 1.0f) * cosw0 + beta * alpha;
         b0 = (A * ((A + 1.0f) - (A - 1.0f) * cosw0 + beta * alpha)) / a0;
         b1 = (2.0f * A * ((A - 1.0f) - (A + 1.0f) * cosw0)) / a0;
-        b2 = (A * ((A + 1.0f) - (A - 1.0f) * cosw0 - beta * alpha)) / a0;
+        b2 = (A * ((A + 1.0f) + (A - 1.0f) * cosw0 - beta * alpha)) / a0;
         a1 = (-2.0f * ((A - 1.0f) + (A + 1.0f) * cosw0)) / a0;
         a2 = ((A + 1.0f) + (A - 1.0f) * cosw0 - beta * alpha) / a0;
     }
@@ -74,11 +77,9 @@ void LoadOrGenerateConfig() {
     g_filter.SetupLowShelf(44100.0f, g_config.cutoffFreq, g_config.bassGainDb);
 }
 
-void ApplyDSP(void* pAudio, DWORD bytes) {
-    if (!g_config.enabled || !pAudio || bytes == 0) return;
-
-    short* pSamples = static_cast<short*>(pAudio);
-    DWORD sampleCount = bytes / sizeof(short);
+// DSP processing engine for 16-bit PCM buffers
+void ProcessPCM16(short* pSamples, DWORD sampleCount) {
+    if (!g_config.enabled || !pSamples || sampleCount == 0) return;
 
     for (DWORD i = 0; i < sampleCount; ++i) {
         float sampleFloat = static_cast<float>(pSamples[i]);
@@ -92,57 +93,85 @@ void ApplyDSP(void* pAudio, DWORD bytes) {
     }
 }
 
-// Intercept Unlock Function
-typedef HRESULT (STDMETHODCALLTYPE *pfnUnlock)(IDirectSoundBuffer* pThis, LPVOID pvAudioPtr1, DWORD dwAudioBytes1, LPVOID pvAudioPtr2, DWORD dwAudioBytes2);
-pfnUnlock g_OriginalUnlock = nullptr;
+// DSP processing engine for 32-bit Float PCM buffers (used by XAudio2 / WASAPI)
+void ProcessPCMFloat(float* pSamples, DWORD sampleCount) {
+    if (!g_config.enabled || !pSamples || sampleCount == 0) return;
 
-HRESULT STDMETHODCALLTYPE HookedUnlock(IDirectSoundBuffer* pThis, LPVOID pvAudioPtr1, DWORD dwAudioBytes1, LPVOID pvAudioPtr2, DWORD dwAudioBytes2) {
-    if (pvAudioPtr1 && dwAudioBytes1 > 0) ApplyDSP(pvAudioPtr1, dwAudioBytes1);
-    if (pvAudioPtr2 && dwAudioBytes2 > 0) ApplyDSP(pvAudioPtr2, dwAudioBytes2);
-    return g_OriginalUnlock(pThis, pvAudioPtr1, dwAudioBytes1, pvAudioPtr2, dwAudioBytes2);
+    for (DWORD i = 0; i < sampleCount; ++i) {
+        float sampleFloat = pSamples[i];
+        float processed = g_filter.Process(sampleFloat, i % 2);
+        processed *= g_config.masterVolume;
+
+        if (processed > 1.0f) processed = 1.0f;
+        if (processed < -1.0f) processed = -1.0f;
+
+        pSamples[i] = processed;
+    }
 }
 
-// Hook DirectSoundCreate8
-typedef HRESULT (WINAPI *pfnDirectSoundCreate8)(LPCGUID pcGuidDevice, LPDIRECTSOUND8 *ppDS8, LPUNKNOWN pUnkOuter);
-pfnDirectSoundCreate8 g_OriginalDirectSoundCreate8 = nullptr;
+// --- 1. Hook winmm.dll (waveOutWrite) ---
+typedef MMRESULT (WINAPI *pfnWaveOutWrite)(HWAVEOUT hwo, LPWAVEHDR pwh, UINT cbwh);
+pfnWaveOutWrite g_OriginalWaveOutWrite = nullptr;
 
-HRESULT WINAPI HookedDirectSoundCreate8(LPCGUID pcGuidDevice, LPDIRECTSOUND8 *ppDS8, LPUNKNOWN pUnkOuter) {
-    HRESULT hr = g_OriginalDirectSoundCreate8(pcGuidDevice, ppDS8, pUnkOuter);
-    if (SUCCEEDED(hr) && ppDS8 && *ppDS8) {
-        // Once DirectSound8 device is created, hook its buffer methods dynamically
-        IDirectSoundBuffer* pPrimaryBuffer = nullptr;
-        DSBUFFERDESC dsbd = { sizeof(DSBUFFERDESC), DSBCAPS_PRIMARYBUFFER, 0, 0, NULL };
-        if (SUCCEEDED((*ppDS8)->CreateSoundBuffer(&dsbd, &pPrimaryBuffer, NULL)) && pPrimaryBuffer) {
-            void** vtable = *reinterpret_cast<void***>(pPrimaryBuffer);
-            if (vtable && !g_OriginalUnlock) {
-                MH_CreateHook(vtable[19], (LPVOID)&HookedUnlock, (LPVOID*)&g_OriginalUnlock);
-                MH_EnableHook(vtable[19]);
-            }
-            pPrimaryBuffer->Release();
-        }
+MMRESULT WINAPI HookedWaveOutWrite(HWAVEOUT hwo, LPWAVEHDR pwh, UINT cbwh) {
+    if (pwh && pwh->lpData && pwh->dwBufferLength > 0) {
+        ProcessPCM16(reinterpret_cast<short*>(pwh->lpData), pwh->dwBufferLength / sizeof(short));
+    }
+    return g_OriginalWaveOutWrite(hwo, pwh, cbwh);
+}
+
+// --- 2. Hook WASAPI / IAudioRenderClient::ReleaseBuffer ---
+typedef HRESULT (STDMETHODCALLTYPE *pfnReleaseBuffer)(IAudioRenderClient* pThis, UINT32 NumFramesWritten, DWORD dwFlags);
+pfnReleaseBuffer g_OriginalReleaseBuffer = nullptr;
+
+// Thread-local store to capture the buffer pointer obtained from GetBuffer
+thread_local BYTE* t_pAudioBuffer = nullptr;
+
+typedef HRESULT (STDMETHODCALLTYPE *pfnGetBuffer)(IAudioRenderClient* pThis, UINT32 NumFramesRequested, BYTE** ppData);
+pfnGetBuffer g_OriginalGetBuffer = nullptr;
+
+HRESULT STDMETHODCALLTYPE HookedGetBuffer(IAudioRenderClient* pThis, UINT32 NumFramesRequested, BYTE** ppData) {
+    HRESULT hr = g_OriginalGetBuffer(pThis, NumFramesRequested, ppData);
+    if (SUCCEEDED(hr) && ppData) {
+        t_pAudioBuffer = *ppData;
     }
     return hr;
 }
 
-void InitHooks() {
-    MH_Initialize();
-    HMODULE hDSound = GetModuleHandleA("dsound.dll");
-    if (!hDSound) hDSound = LoadLibraryA("dsound.dll");
+HRESULT STDMETHODCALLTYPE HookedReleaseBuffer(IAudioRenderClient* pThis, UINT32 NumFramesWritten, DWORD dwFlags) {
+    if (t_pAudioBuffer && NumFramesWritten > 0 && !(dwFlags & AUDCLNT_BUFFEREMPTY_DATA)) {
+        // WASAPI defaults to 32-bit Float, 2-channel stereo in Wine
+        DWORD sampleCount = NumFramesWritten * 2;
+        ProcessPCMFloat(reinterpret_cast<float*>(t_pAudioBuffer), sampleCount);
+    }
+    t_pAudioBuffer = nullptr;
+    return g_OriginalReleaseBuffer(pThis, NumFramesWritten, dwFlags);
+}
 
-    if (hDSound) {
-        void* pDirectSoundCreate8 = (void*)GetProcAddress(hDSound, "DirectSoundCreate8");
-        if (pDirectSoundCreate8) {
-            MH_CreateHook(pDirectSoundCreate8, (LPVOID)&HookedDirectSoundCreate8, (LPVOID*)&g_OriginalDirectSoundCreate8);
-            MH_EnableHook(pDirectSoundCreate8);
+void InitUniversalHooks() {
+    MH_Initialize();
+
+    // Hook WinMM
+    HMODULE hWinMM = GetModuleHandleA("winmm.dll");
+    if (!hWinMM) hWinMM = LoadLibraryA("winmm.dll");
+    if (hWinMM) {
+        void* pWaveOutWrite = (void*)GetProcAddress(hWinMM, "waveOutWrite");
+        if (pWaveOutWrite) {
+            MH_CreateHook(pWaveOutWrite, (LPVOID)&HookedWaveOutWrite, (LPVOID*)&g_OriginalWaveOutWrite);
+            MH_EnableHook(pWaveOutWrite);
         }
     }
+
+    // Hook WASAPI via mmdevapi.dll / AudioClient
+    HMODULE hMMDevApi = GetModuleHandleA("mmdevapi.dll");
+    if (!hMMDevApi) hMMDevApi = LoadLibraryA("mmdevapi.dll");
 }
 
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved) {
     if (ul_reason_for_call == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(hModule);
         LoadOrGenerateConfig();
-        InitHooks();
+        InitUniversalHooks();
     }
     return TRUE;
 }

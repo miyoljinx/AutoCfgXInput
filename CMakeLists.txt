@@ -1,10 +1,10 @@
 cmake_minimum_required(VERSION 3.15)
-project(BassBoosterPlugin CXX)
+project(BassBoosterPlugin CXX C)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Fetch MinHook from GitHub
+# Fetch MinHook directly from GitHub
 include(FetchContent)
 FetchContent_Declare(
     minhook
@@ -13,14 +13,8 @@ FetchContent_Declare(
 )
 FetchContent_MakeAvailable(minhook)
 
-# Collect MinHook source files directly
-file(GLOB MINHOOK_SOURCES
-    "${minhook_SOURCE_DIR}/src/*.c"
-    "${minhook_SOURCE_DIR}/src/hde/*.c"
-)
-
-# Build BassBooster together with MinHook sources directly
-add_library(BassBooster SHARED bass_booster.cpp ${MINHOOK_SOURCES})
+# Define our plugin library
+add_library(BassBooster SHARED bass_booster.cpp)
 
 set_target_properties(BassBooster PROPERTIES
     PREFIX ""
@@ -28,15 +22,9 @@ set_target_properties(BassBooster PROPERTIES
     OUTPUT_NAME "BassBooster"
 )
 
-# Include MinHook headers
-target_include_directories(BassBooster PRIVATE 
-    ${minhook_SOURCE_DIR}/include
-    ${minhook_SOURCE_DIR}/src
-    ${minhook_SOURCE_DIR}/src/hde
-)
+# Tell CMake to use MinHook's include headers and link its static library target
+target_include_directories(BassBooster PRIVATE ${minhook_SOURCE_DIR}/include)
+target_link_libraries(BassBooster PRIVATE minhook winmm ole32)
 
-# Link Windows Multimedia system library
-target_link_libraries(BassBooster PRIVATE winmm)
-
-# Statically link runtime dependencies to avoid ERROR_MOD_NOT_FOUND (126) in Wine
+# Statically link runtime dependencies so Wine doesn't throw Error 126
 target_link_options(BassBooster PRIVATE -static -static-libgcc -static-libstdc++)

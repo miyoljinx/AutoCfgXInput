@@ -1,127 +1,602 @@
 #include <windows.h>
-#include <mmeapi.h>
-#include <cmath>
+#include <xaudio2.h>
+
+#include <MinHook.h>
+
 #include <fstream>
 #include <string>
-#include "MinHook.h"
+#include <mutex>
+#include <cstdarg>
+#include <cstdio>
+#include <cmath>
+
+// ============================================================
+// CONFIG
+// ============================================================
 
 struct Config {
-    bool enabled = true;
-    float bassGainDb = 10.0f;
-    float cutoffFreq = 100.0f;
-    float masterVolume = 0.2f; // Set low (20%) for immediate hearing test
+bool enabled = true;
+
+float bassGainDb = 10.0f;
+float cutoffFreq = 100.0f;
+
+// 1.0 = original volume
+// Keep this at 1.0 for initial testing.
+float masterVolume = 1.0f;
+
 } g_config;
 
-struct BiquadFilter {
-    float b0, b1, b2, a1, a2;
-    float x1[2] = {0}, x2[2] = {0};
-    float y1[2] = {0}, y2[2] = {0};
+// ============================================================
+// GLOBALS
+// ============================================================
 
-    void SetupLowShelf(float sampleRate, float cutoffFreq, float gainDb) {
-        if (gainDb == 0.0f) {
-            b0 = 1.0f; b1 = a1 = a2 = b2 = 0.0f;
-            return;
-        }
-        float A = powf(10.0f, gainDb / 40.0f);
-        float w0 = 2.0f * 3.14159265359f * cutoffFreq / sampleRate;
-        float alpha = sinf(w0) / 2.0f * sqrtf(2.0f);
-        float cosw0 = cosf(w0);
-        float beta = sqrtf(A) / 0.707f;
+static HMODULE g_module = nullptr;
 
-        float a0 = (A + 1.0f) + (A - 1.0f) * cosw0 + beta * alpha;
-        b0 = (A * ((A + 1.0f) - (A - 1.0f) * cosw0 + beta * alpha)) / a0;
-        b1 = (2.0f * A * ((A - 1.0f) - (A + 1.0f) * cosw0)) / a0;
-        b2 = (A * ((A + 1.0f) - (A - 1.0f) * cosw0 - beta * alpha)) / a0;
-        a1 = (-2.0f * ((A - 1.0f) + (A + 1.0f) * cosw0)) / a0;
-        a2 = ((A + 1.0f) + (A - 1.0f) * cosw0 - beta * alpha) / a0;
-    }
+static std::string g_gameDirectory;
+static std::string g_logPath;
+static std::string g_iniPath;
 
-    inline float Process(float in, int ch) {
-        float out = b0 * in + b1 * x1[ch] + b2 * x2[ch] - a1 * y1[ch] - a2 * y2[ch];
-        x2[ch] = x1[ch]; x1[ch] = in;
-        y2[ch] = y1[ch]; y1[ch] = out;
-        return out;
-    }
-} g_filter;
+static std::mutex g_logMutex;
 
-void LoadOrGenerateConfig() {
-    char modulePath[MAX_PATH];
-    GetModuleFileNameA(NULL, modulePath, MAX_PATH);
-    std::string path(modulePath);
-    std::string iniPath = path.substr(0, path.find_last_of("\\/")) + "\\bass_boost.ini";
+// ============================================================
+// LOGGING
+// ============================================================
 
-    DWORD attrib = GetFileAttributesA(iniPath.c_str());
-    if (attrib == INVALID_FILE_ATTRIBUTES) {
-        std::ofstream iniFile(iniPath);
-        if (iniFile.is_open()) {
-            iniFile << "[BassBooster]\nEnabled=1\nBassGainDb=10.0\nCutoffFreq=100.0\nMasterVolume=0.2\n";
-            iniFile.close();
-        }
-    }
+void Log(const char* format, ...)
+{
+std::lock_guard"std::mutex" (std::mutex) lock(g_logMutex);
 
-    g_config.enabled = GetPrivateProfileIntA("BassBooster", "Enabled", 1, iniPath.c_str()) != 0;
-    
-    char buffer[32];
-    GetPrivateProfileStringA("BassBooster", "BassGainDb", "10.0", buffer, sizeof(buffer), iniPath.c_str());
-    g_config.bassGainDb = static_cast<float>(atof(buffer));
+FILE* file = nullptr;
 
-    GetPrivateProfileStringA("BassBooster", "CutoffFreq", "100.0", buffer, sizeof(buffer), iniPath.c_str());
-    g_config.cutoffFreq = static_cast<float>(atof(buffer));
+fopen_s(&file, g_logPath.c_str(), "a");
 
-    GetPrivateProfileStringA("BassBooster", "MasterVolume", "0.2", buffer, sizeof(buffer), iniPath.c_str());
-    g_config.masterVolume = static_cast<float>(atof(buffer));
+if (!file)
+    return;
 
-    g_filter.SetupLowShelf(44100.0f, g_config.cutoffFreq, g_config.bassGainDb);
+SYSTEMTIME st;
+GetLocalTime(&st);
+
+fprintf(
+    file,
+    "[%02u:%02u:%02u.%03u] ",
+    st.wHour,
+    st.wMinute,
+    st.wSecond,
+    st.wMilliseconds
+);
+
+va_list args;
+va_start(args, format);
+
+vfprintf(file, format, args);
+
+va_end(args);
+
+fprintf(file, "\n");
+
+fclose(file);
+
 }
 
-// PCM 16-bit processing buffer hook
-void ProcessPCM16(short* pSamples, DWORD sampleCount) {
-    if (!g_config.enabled || !pSamples || sampleCount == 0) return;
+// ============================================================
+// GAME DIRECTORY
+// ============================================================
 
-    for (DWORD i = 0; i < sampleCount; ++i) {
-        float sampleFloat = static_cast<float>(pSamples[i]);
-        float processed = g_filter.Process(sampleFloat, i % 2);
-        processed *= g_config.masterVolume;
+void InitializePaths()
+{
+char exePath[MAX_PATH] = {};
 
-        if (processed > 32767.0f) processed = 32767.0f;
-        if (processed < -32768.0f) processed = -32768.0f;
+GetModuleFileNameA(
+    nullptr,
+    exePath,
+    MAX_PATH
+);
 
-        pSamples[i] = static_cast<short>(processed);
+std::string path = exePath;
+
+size_t slash = path.find_last_of("\\/");
+
+if (slash != std::string::npos)
+    g_gameDirectory = path.substr(0, slash);
+else
+    g_gameDirectory = ".";
+
+g_logPath =
+    g_gameDirectory +
+    "\\bass_boost.log";
+
+g_iniPath =
+    g_gameDirectory +
+    "\\bass_boost.ini";
+
+}
+
+// ============================================================
+// CONFIG
+// ============================================================
+
+void LoadOrGenerateConfig()
+{
+DWORD attrib =
+GetFileAttributesA(
+g_iniPath.c_str()
+);
+
+if (attrib == INVALID_FILE_ATTRIBUTES)
+{
+    std::ofstream ini(g_iniPath);
+
+    if (ini.is_open())
+    {
+        ini <<
+            "[BassBooster]\n"
+            "Enabled=1\n"
+            "BassGainDb=10.0\n"
+            "CutoffFreq=100.0\n"
+            "MasterVolume=1.0\n";
+
+        ini.close();
+    }
+
+    Log(
+        "Created config: %s",
+        g_iniPath.c_str()
+    );
+}
+
+g_config.enabled =
+    GetPrivateProfileIntA(
+        "BassBooster",
+        "Enabled",
+        1,
+        g_iniPath.c_str()
+    ) != 0;
+
+
+char buffer[64];
+
+
+GetPrivateProfileStringA(
+    "BassBooster",
+    "BassGainDb",
+    "10.0",
+    buffer,
+    sizeof(buffer),
+    g_iniPath.c_str()
+);
+
+g_config.bassGainDb =
+    static_cast<float>(
+        atof(buffer)
+    );
+
+
+GetPrivateProfileStringA(
+    "BassBooster",
+    "CutoffFreq",
+    "100.0",
+    buffer,
+    sizeof(buffer),
+    g_iniPath.c_str()
+);
+
+g_config.cutoffFreq =
+    static_cast<float>(
+        atof(buffer)
+    );
+
+
+GetPrivateProfileStringA(
+    "BassBooster",
+    "MasterVolume",
+    "1.0",
+    buffer,
+    sizeof(buffer),
+    g_iniPath.c_str()
+);
+
+g_config.masterVolume =
+    static_cast<float>(
+        atof(buffer)
+    );
+
+
+Log(
+    "Config loaded:"
+);
+
+Log(
+    "Enabled=%d",
+    g_config.enabled
+);
+
+Log(
+    "BassGainDb=%.2f",
+    g_config.bassGainDb
+);
+
+Log(
+    "CutoffFreq=%.2f",
+    g_config.cutoffFreq
+);
+
+Log(
+    "MasterVolume=%.2f",
+    g_config.masterVolume
+);
+
+}
+
+// ============================================================
+// XAudio2Create HOOK
+// ============================================================
+
+typedef HRESULT (WINAPI* XAudio2Create_t)(
+IXAudio2** ppXAudio2,
+UINT32 Flags,
+XAUDIO2_PROCESSOR XAudio2Processor
+);
+
+static XAudio2Create_t
+g_originalXAudio2Create = nullptr;
+
+// ============================================================
+// HOOK
+// ============================================================
+
+HRESULT WINAPI HookedXAudio2Create(
+IXAudio2** ppXAudio2,
+UINT32 Flags,
+XAUDIO2_PROCESSOR XAudio2Processor
+)
+{
+Log(
+">>> XAudio2Create CALLED"
+);
+
+Log(
+    "Flags = %u",
+    Flags
+);
+
+Log(
+    "Processor = %u",
+    static_cast<unsigned>(XAudio2Processor)
+);
+
+
+HRESULT result =
+    g_originalXAudio2Create(
+        ppXAudio2,
+        Flags,
+        XAudio2Processor
+    );
+
+
+Log(
+    "XAudio2Create result = 0x%08X",
+    static_cast<unsigned>(result)
+);
+
+
+if (SUCCEEDED(result) &&
+    ppXAudio2 &&
+    *ppXAudio2)
+{
+    Log(
+        ">>> IXAudio2 OBJECT CREATED: %p",
+        *ppXAudio2
+    );
+
+    Log(
+        "Next stage required: "
+        "hook CreateSourceVoice on this IXAudio2 instance"
+    );
+}
+else
+{
+    Log(
+        "XAudio2Create failed or returned null object"
+    );
+}
+
+
+return result;
+
+}
+
+// ============================================================
+// XAudio DLL DETECTION
+// ============================================================
+
+struct XAudioCandidate
+{
+const char* dllName;
+};
+
+static const XAudioCandidate
+g_xaudioCandidates[] =
+{
+{ "xaudio2_9.dll" },
+{ "xaudio2_8.dll" },
+{ "xaudio2_7.dll" },
+{ "xaudio2.dll" }
+};
+
+// ============================================================
+// INSTALL XAudio HOOK
+// ============================================================
+
+bool TryHookXAudioDLL(
+const char* dllName
+)
+{
+HMODULE module =
+GetModuleHandleA(
+dllName
+);
+
+if (!module)
+{
+    Log(
+        "%s not currently loaded",
+        dllName
+    );
+
+    return false;
+}
+
+
+Log(
+    "%s detected at %p",
+    dllName,
+    module
+);
+
+
+FARPROC proc =
+    GetProcAddress(
+        module,
+        "XAudio2Create"
+    );
+
+
+if (!proc)
+{
+    Log(
+        "%s loaded but XAudio2Create export not found",
+        dllName
+    );
+
+    return false;
+}
+
+
+Log(
+    "XAudio2Create found in %s at %p",
+    dllName,
+    proc
+);
+
+
+MH_STATUS status =
+    MH_CreateHook(
+        reinterpret_cast<LPVOID>(proc),
+        reinterpret_cast<LPVOID>(
+            &HookedXAudio2Create
+        ),
+        reinterpret_cast<LPVOID*>(
+            &g_originalXAudio2Create
+        )
+    );
+
+
+if (status != MH_OK)
+{
+    Log(
+        "MH_CreateHook failed for %s. Status=%d",
+        dllName,
+        static_cast<int>(status)
+    );
+
+    return false;
+}
+
+
+status =
+    MH_EnableHook(
+        reinterpret_cast<LPVOID>(proc)
+    );
+
+
+if (status != MH_OK)
+{
+    Log(
+        "MH_EnableHook failed for %s. Status=%d",
+        dllName,
+        static_cast<int>(status)
+    );
+
+    return false;
+}
+
+
+Log(
+    "SUCCESS: XAudio2Create hook installed for %s",
+    dllName
+);
+
+
+return true;
+
+}
+
+// ============================================================
+// INITIALIZE XAudio HOOK
+// ============================================================
+
+void InitializeXAudioHooks()
+{
+Log(
+"================================================"
+);
+
+Log(
+    "Scanning for XAudio DLLs..."
+);
+
+
+bool hooked = false;
+
+
+for (const auto& candidate :
+     g_xaudioCandidates)
+{
+    if (TryHookXAudioDLL(
+            candidate.dllName
+        ))
+    {
+        hooked = true;
     }
 }
 
-typedef MMRESULT (WINAPI *pfnWaveOutWrite)(HWAVEOUT hwo, LPWAVEHDR pwh, UINT cbwh);
-pfnWaveOutWrite g_OriginalWaveOutWrite = nullptr;
 
-MMRESULT WINAPI HookedWaveOutWrite(HWAVEOUT hwo, LPWAVEHDR pwh, UINT cbwh) {
-    if (pwh && pwh->lpData && pwh->dwBufferLength > 0) {
-        ProcessPCM16(reinterpret_cast<short*>(pwh->lpData), pwh->dwBufferLength / sizeof(short));
-    }
-    return g_OriginalWaveOutWrite(hwo, pwh, cbwh);
+if (!hooked)
+{
+    Log(
+        "No XAudio DLL currently loaded."
+    );
+
+    Log(
+        "IMPORTANT:"
+    );
+
+    Log(
+        "Game may load XAudio later."
+    );
+
+    Log(
+        "This diagnostic version currently only hooks "
+        "DLLs already loaded at ASI initialization."
+    );
 }
 
-void InitHooks() {
-    if (MH_Initialize() != MH_OK) return;
 
-    HMODULE hWinMM = GetModuleHandleA("winmm.dll");
-    if (!hWinMM) hWinMM = LoadLibraryA("winmm.dll");
+Log(
+    "================================================"
+);
 
-    if (hWinMM) {
-        void* pWaveOutWrite = (void*)GetProcAddress(hWinMM, "waveOutWrite");
-        if (pWaveOutWrite) {
-            MH_CreateHook(pWaveOutWrite, (LPVOID)&HookedWaveOutWrite, (LPVOID*)&g_OriginalWaveOutWrite);
-            MH_EnableHook(pWaveOutWrite);
-        }
+}
+
+// ============================================================
+// THREAD
+// ============================================================
+
+DWORD WINAPI InitThread(
+LPVOID
+)
+{
+InitializePaths();
+
+// Fresh log every launch.
+
+DeleteFileA(
+    g_logPath.c_str()
+);
+
+
+Log(
+    "Bass Boost ASI started"
+);
+
+Log(
+    "Game directory: %s",
+    g_gameDirectory.c_str()
+);
+
+
+LoadOrGenerateConfig();
+
+
+MH_STATUS status =
+    MH_Initialize();
+
+
+Log(
+    "MH_Initialize result = %d",
+    static_cast<int>(status)
+);
+
+
+if (status != MH_OK &&
+    status != MH_ERROR_ALREADY_INITIALIZED)
+{
+    Log(
+        "MinHook initialization failed"
+    );
+
+    return 0;
+}
+
+
+InitializeXAudioHooks();
+
+
+Log(
+    "Initialization finished"
+);
+
+
+return 0;
+
+}
+
+// ============================================================
+// DLL ENTRY
+// ============================================================
+
+BOOL APIENTRY DllMain(
+HMODULE hModule,
+DWORD reason,
+LPVOID
+)
+{
+if (reason == DLL_PROCESS_ATTACH)
+{
+g_module = hModule;
+
+    DisableThreadLibraryCalls(
+        hModule
+    );
+
+
+    HANDLE thread =
+        CreateThread(
+            nullptr,
+            0,
+            InitThread,
+            nullptr,
+            0,
+            nullptr
+        );
+
+
+    if (thread)
+    {
+        CloseHandle(
+            thread
+        );
     }
 }
 
-BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved) {
-    if (ul_reason_for_call == DLL_PROCESS_ATTACH) {
-        DisableThreadLibraryCalls(hModule);
-        LoadOrGenerateConfig();
-        InitHooks();
-    } else if (ul_reason_for_call == DLL_PROCESS_DETACH) {
-        MH_Uninitialize();
-    }
-    return TRUE;
+
+else if (reason ==
+         DLL_PROCESS_DETACH)
+{
+    MH_Uninitialize();
+}
+
+
+return TRUE;
+
 }

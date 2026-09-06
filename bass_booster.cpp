@@ -1,4 +1,5 @@
 #include <windows.h>
+#include <objbase.h>
 #include <xaudio2.h>
 
 #include <MinHook.h>
@@ -11,7 +12,9 @@
 #include <cstdlib>
 #include <thread>
 #include <atomic>
+#include <vector>
 #include <algorithm>
+#include <cctype>
 
 // ============================================================
 // CONFIG
@@ -19,16 +22,15 @@
 
 struct Config
 {
-bool enabled = true;
+    bool enabled = true;
 
-float bassGainDb = 10.0f;
-float cutoffFreq = 100.0f;
-
-float masterVolume = 1.0f;
-
+    float bassGainDb = 10.0f;
+    float cutoffFreq = 100.0f;
+    float masterVolume = 1.0f;
 };
 
 static Config g_config;
+
 
 // ============================================================
 // GLOBAL STATE
@@ -44,10 +46,11 @@ static std::mutex g_logMutex;
 
 static std::atomic<bool> g_running(true);
 
-static std::atomic<bool> g_xaudio27Hooked(false);
-static std::atomic<bool> g_xaudio28Hooked(false);
-static std::atomic<bool> g_xaudio29Hooked(false);
-static std::atomic<bool> g_xaudioHooked(false);
+static std::atomic<bool> g_xaudioDllDetected(false);
+static std::atomic<bool> g_dllGetClassObjectHooked(false);
+static std::atomic<bool> g_factoryCreateInstanceHooked(false);
+static std::atomic<bool> g_createSourceVoiceHooked(false);
+
 
 // ============================================================
 // LOGGING
@@ -55,1138 +58,1520 @@ static std::atomic<bool> g_xaudioHooked(false);
 
 static void Log(const char* format, ...)
 {
-std::lock_guard<std::mutex> lock(g_logMutex);
-FILE* file =
-    fopen(
-        g_logPath.c_str(),
-        "a"
+    std::lock_guard<std::mutex> lock(g_logMutex);
+
+    FILE* file =
+        fopen(
+            g_logPath.c_str(),
+            "a"
+        );
+
+    if (!file)
+        return;
+
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+
+    fprintf(
+        file,
+        "[%02u:%02u:%02u.%03u] ",
+        st.wHour,
+        st.wMinute,
+        st.wSecond,
+        st.wMilliseconds
     );
 
-if (!file)
-    return;
+    va_list args;
 
+    va_start(args, format);
 
-SYSTEMTIME st;
+    vfprintf(
+        file,
+        format,
+        args
+    );
 
-GetLocalTime(&st);
+    va_end(args);
 
+    fprintf(
+        file,
+        "\n"
+    );
 
-fprintf(
-    file,
-    "[%02u:%02u:%02u.%03u] ",
-    st.wHour,
-    st.wMinute,
-    st.wSecond,
-    st.wMilliseconds
-);
-
-
-va_list args;
-
-va_start(args, format);
-
-vfprintf(
-    file,
-    format,
-    args
-);
-
-va_end(args);
-
-
-fprintf(
-    file,
-    "\n"
-);
-
-
-fclose(file);
-
+    fclose(file);
 }
 
+
 // ============================================================
-// INITIALIZE PATHS
+// PATH INITIALIZATION
 // ============================================================
 
 static void InitializePaths()
 {
-char exePath[MAX_PATH] = {};
+    char exePath[MAX_PATH] = {};
 
-DWORD length =
-    GetModuleFileNameA(
-        nullptr,
-        exePath,
-        MAX_PATH
-    );
+    DWORD length =
+        GetModuleFileNameA(
+            nullptr,
+            exePath,
+            MAX_PATH
+        );
 
-
-if (length == 0)
-{
-    g_gameDirectory = ".";
-}
-else
-{
-    std::string path(exePath);
-
-    size_t slash =
-        path.find_last_of("\\/");
-
-
-    if (slash != std::string::npos)
-    {
-        g_gameDirectory =
-            path.substr(
-                0,
-                slash
-            );
-    }
-    else
+    if (length == 0)
     {
         g_gameDirectory = ".";
     }
+    else
+    {
+        std::string path(exePath);
+
+        size_t slash =
+            path.find_last_of("\\/");
+
+        if (slash != std::string::npos)
+        {
+            g_gameDirectory =
+                path.substr(
+                    0,
+                    slash
+                );
+        }
+        else
+        {
+            g_gameDirectory = ".";
+        }
+    }
+
+    g_logPath =
+        g_gameDirectory +
+        "\\bass_boost.log";
+
+    g_iniPath =
+        g_gameDirectory +
+        "\\bass_boost.ini";
 }
 
-
-g_logPath =
-    g_gameDirectory +
-    "\\bass_boost.log";
-
-
-g_iniPath =
-    g_gameDirectory +
-    "\\bass_boost.ini";
-
-}
 
 // ============================================================
-// CONFIG
+// CONFIGURATION
 // ============================================================
 
 static void LoadOrGenerateConfig()
 {
-DWORD attrib =
-GetFileAttributesA(
-g_iniPath.c_str()
+    DWORD attrib =
+        GetFileAttributesA(
+            g_iniPath.c_str()
+        );
+
+    if (attrib == INVALID_FILE_ATTRIBUTES)
+    {
+        std::ofstream ini(
+            g_iniPath
+        );
+
+        if (ini.is_open())
+        {
+            ini <<
+                "[BassBooster]\n"
+                "Enabled=1\n"
+                "BassGainDb=10.0\n"
+                "CutoffFreq=100.0\n"
+                "MasterVolume=1.0\n";
+
+            ini.close();
+
+            Log(
+                "Created config: %s",
+                g_iniPath.c_str()
+            );
+        }
+        else
+        {
+            Log(
+                "ERROR: Could not create config"
+            );
+        }
+    }
+
+    g_config.enabled =
+        GetPrivateProfileIntA(
+            "BassBooster",
+            "Enabled",
+            1,
+            g_iniPath.c_str()
+        ) != 0;
+
+    char buffer[64] = {};
+
+    GetPrivateProfileStringA(
+        "BassBooster",
+        "BassGainDb",
+        "10.0",
+        buffer,
+        sizeof(buffer),
+        g_iniPath.c_str()
+    );
+
+    g_config.bassGainDb =
+        static_cast<float>(
+            atof(buffer)
+        );
+
+    GetPrivateProfileStringA(
+        "BassBooster",
+        "CutoffFreq",
+        "100.0",
+        buffer,
+        sizeof(buffer),
+        g_iniPath.c_str()
+    );
+
+    g_config.cutoffFreq =
+        static_cast<float>(
+            atof(buffer)
+        );
+
+    GetPrivateProfileStringA(
+        "BassBooster",
+        "MasterVolume",
+        "1.0",
+        buffer,
+        sizeof(buffer),
+        g_iniPath.c_str()
+    );
+
+    g_config.masterVolume =
+        static_cast<float>(
+            atof(buffer)
+        );
+
+    Log(
+        "Configuration:"
+    );
+
+    Log(
+        "  Enabled = %d",
+        g_config.enabled ? 1 : 0
+    );
+
+    Log(
+        "  BassGainDb = %.2f",
+        g_config.bassGainDb
+    );
+
+    Log(
+        "  CutoffFreq = %.2f",
+        g_config.cutoffFreq
+    );
+
+    Log(
+        "  MasterVolume = %.2f",
+        g_config.masterVolume
+    );
+}
+
+
+// ============================================================
+// XAudio2 GUIDs
+// ============================================================
+
+// CLSID_XAudio2
+static const GUID g_CLSID_XAudio2 =
+{
+    0x5a508685,
+    0xa254,
+    0x4fba,
+    {
+        0x9b,
+        0x82,
+        0x9a,
+        0x24,
+        0xb0,
+        0x03,
+        0x06,
+        0xaf
+    }
+};
+
+
+// IID_IXAudio2
+static const GUID g_IID_IXAudio2 =
+{
+    0x8bcf1f58,
+    0x9fe7,
+    0x4583,
+    {
+        0x8a,
+        0xc6,
+        0xe2,
+        0xad,
+        0xc4,
+        0x65,
+        0xc8,
+        0xbb
+    }
+};
+
+
+// ============================================================
+// DllGetClassObject
+// ============================================================
+
+typedef HRESULT (WINAPI* DllGetClassObject_t)(
+    REFCLSID rclsid,
+    REFIID riid,
+    LPVOID* ppv
 );
 
-if (attrib ==
-    INVALID_FILE_ATTRIBUTES)
+static DllGetClassObject_t
+    g_originalDllGetClassObject = nullptr;
+
+
+// ============================================================
+// IClassFactory
+// ============================================================
+
+typedef HRESULT (STDMETHODCALLTYPE* IClassFactory_CreateInstance_t)(
+    IClassFactory* This,
+    IUnknown* pUnkOuter,
+    REFIID riid,
+    void** ppvObject
+);
+
+static IClassFactory_CreateInstance_t
+    g_originalFactoryCreateInstance = nullptr;
+
+
+// ============================================================
+// IXAudio2
+// ============================================================
+
+typedef HRESULT (STDMETHODCALLTYPE* IXAudio2_CreateSourceVoice_t)(
+    IXAudio2* This,
+    IXAudio2SourceVoice** ppSourceVoice,
+    const WAVEFORMATEX* pSourceFormat,
+    UINT32 Flags,
+    float MaxFrequencyRatio,
+    IXAudio2VoiceCallback* pCallback,
+    const XAUDIO2_VOICE_SENDS* pSendList,
+    const XAUDIO2_EFFECT_CHAIN* pEffectChain
+);
+
+static IXAudio2_CreateSourceVoice_t
+    g_originalCreateSourceVoice = nullptr;
+
+
+// ============================================================
+// IXAudio2SourceVoice
+// ============================================================
+
+typedef HRESULT (STDMETHODCALLTYPE* IXAudio2SourceVoice_SubmitSourceBuffer_t)(
+    IXAudio2SourceVoice* This,
+    const XAUDIO2_BUFFER* pBuffer,
+    const XAUDIO2_BUFFER_WMA* pBufferWMA
+);
+
+
+// ============================================================
+// TRACK SOURCE VOICES
+// ============================================================
+
+struct HookedVoice
 {
-    std::ofstream ini(
-        g_iniPath
+    IXAudio2SourceVoice* voice;
+    void* originalSubmit;
+};
+
+static std::mutex g_voiceMutex;
+
+static std::vector<HookedVoice>
+    g_hookedVoices;
+
+
+// ============================================================
+// SOURCE VOICE SUBMIT HOOK
+// ============================================================
+
+static HRESULT STDMETHODCALLTYPE
+HookedSubmitSourceBuffer(
+    IXAudio2SourceVoice* This,
+    const XAUDIO2_BUFFER* pBuffer,
+    const XAUDIO2_BUFFER_WMA* pBufferWMA
+)
+{
+    if (pBuffer)
+    {
+        Log(
+            "------------------------------------------------"
+        );
+
+        Log(
+            ">>> SubmitSourceBuffer"
+        );
+
+        Log(
+            "Voice = %p",
+            static_cast<void*>(This)
+        );
+
+        Log(
+            "AudioData = %p",
+            pBuffer->pAudioData
+        );
+
+        Log(
+            "AudioBytes = %u",
+            pBuffer->AudioBytes
+        );
+
+        Log(
+            "PlayBegin = %u",
+            pBuffer->PlayBegin
+        );
+
+        Log(
+            "PlayLength = %u",
+            pBuffer->PlayLength
+        );
+
+        Log(
+            "LoopBegin = %u",
+            pBuffer->LoopBegin
+        );
+
+        Log(
+            "LoopLength = %u",
+            pBuffer->LoopLength
+        );
+
+        Log(
+            "LoopCount = %u",
+            pBuffer->LoopCount
+        );
+
+        Log(
+            "Flags = 0x%08X",
+            pBuffer->Flags
+        );
+
+        Log(
+            "Context = %p",
+            pBuffer->pContext
+        );
+    }
+
+
+    IXAudio2SourceVoice_SubmitSourceBuffer_t original =
+        nullptr;
+
+
+    {
+        std::lock_guard<std::mutex> lock(
+            g_voiceMutex
+        );
+
+
+        for (
+            const HookedVoice& voice :
+            g_hookedVoices
+        )
+        {
+            if (voice.voice == This)
+            {
+                original =
+                    reinterpret_cast<
+                        IXAudio2SourceVoice_SubmitSourceBuffer_t
+                    >(
+                        voice.originalSubmit
+                    );
+
+                break;
+            }
+        }
+    }
+
+
+    if (!original)
+    {
+        Log(
+            "ERROR: Original SubmitSourceBuffer "
+            "not found"
+        );
+
+        return E_FAIL;
+    }
+
+
+    HRESULT result =
+        original(
+            This,
+            pBuffer,
+            pBufferWMA
+        );
+
+
+    Log(
+        "SubmitSourceBuffer result = 0x%08X",
+        static_cast<unsigned>(result)
     );
 
 
-    if (ini.is_open())
+    return result;
+}
+
+
+// ============================================================
+// HOOK SOURCE VOICE
+// ============================================================
+
+static bool HookSourceVoice(
+    IXAudio2SourceVoice* voice
+)
+{
+    if (!voice)
+        return false;
+
+
+    std::lock_guard<std::mutex> lock(
+        g_voiceMutex
+    );
+
+
+    for (
+        const HookedVoice& existing :
+        g_hookedVoices
+    )
     {
-        ini <<
-            "[BassBooster]\n"
-            "Enabled=1\n"
-            "BassGainDb=10.0\n"
-            "CutoffFreq=100.0\n"
-            "MasterVolume=1.0\n";
+        if (existing.voice == voice)
+            return true;
+    }
 
-        ini.close();
 
+    void** vtable =
+        *reinterpret_cast<void***>(
+            voice
+        );
+
+
+    if (!vtable)
+    {
+        Log(
+            "ERROR: SourceVoice vtable NULL"
+        );
+
+        return false;
+    }
+
+
+    // IXAudio2SourceVoice::SubmitSourceBuffer
+    // is vtable entry 24.
+
+    void* submitAddress =
+        vtable[24];
+
+
+    if (!submitAddress)
+    {
+        Log(
+            "ERROR: SubmitSourceBuffer address NULL"
+        );
+
+        return false;
+    }
+
+
+    Log(
+        "SourceVoice vtable = %p",
+        static_cast<void*>(vtable)
+    );
+
+
+    Log(
+        "SubmitSourceBuffer = %p",
+        submitAddress
+    );
+
+
+    MH_STATUS status =
+        MH_CreateHook(
+            submitAddress,
+            reinterpret_cast<LPVOID>(
+                &HookedSubmitSourceBuffer
+            ),
+            nullptr
+        );
+
+
+    if (
+        status != MH_OK &&
+        status != MH_ERROR_ALREADY_CREATED
+    )
+    {
+        Log(
+            "MH_CreateHook SubmitSourceBuffer failed: %d",
+            static_cast<int>(status)
+        );
+
+        return false;
+    }
+
+
+    status =
+        MH_EnableHook(
+            submitAddress
+        );
+
+
+    if (
+        status != MH_OK &&
+        status != MH_ERROR_ENABLED
+    )
+    {
+        Log(
+            "MH_EnableHook SubmitSourceBuffer failed: %d",
+            static_cast<int>(status)
+        );
+
+        return false;
+    }
+
+
+    HookedVoice entry;
+
+    entry.voice =
+        voice;
+
+    entry.originalSubmit =
+        submitAddress;
+
+
+    g_hookedVoices.push_back(
+        entry
+    );
+
+
+    Log(
+        ">>> SUCCESS: SourceVoice hooked"
+    );
+
+
+    Log(
+        ">>> Voice = %p",
+        static_cast<void*>(voice)
+    );
+
+
+    return true;
+}
+
+
+// ============================================================
+// IXAudio2::CreateSourceVoice
+// ============================================================
+
+static HRESULT STDMETHODCALLTYPE
+HookedCreateSourceVoice(
+    IXAudio2* This,
+    IXAudio2SourceVoice** ppSourceVoice,
+    const WAVEFORMATEX* pSourceFormat,
+    UINT32 Flags,
+    float MaxFrequencyRatio,
+    IXAudio2VoiceCallback* pCallback,
+    const XAUDIO2_VOICE_SENDS* pSendList,
+    const XAUDIO2_EFFECT_CHAIN* pEffectChain
+)
+{
+    Log(
+        "================================================"
+    );
+
+    Log(
+        ">>> IXAudio2::CreateSourceVoice"
+    );
+
+    Log(
+        "IXAudio2 = %p",
+        static_cast<void*>(This)
+    );
+
+
+    if (pSourceFormat)
+    {
+        Log(
+            "Audio format:"
+        );
 
         Log(
-            "Created config: %s",
-            g_iniPath.c_str()
+            "  wFormatTag = 0x%04X",
+            pSourceFormat->wFormatTag
+        );
+
+        Log(
+            "  Channels = %u",
+            pSourceFormat->nChannels
+        );
+
+        Log(
+            "  SampleRate = %u",
+            pSourceFormat->nSamplesPerSec
+        );
+
+        Log(
+            "  AvgBytesPerSec = %u",
+            pSourceFormat->nAvgBytesPerSec
+        );
+
+        Log(
+            "  BlockAlign = %u",
+            pSourceFormat->nBlockAlign
+        );
+
+        Log(
+            "  BitsPerSample = %u",
+            pSourceFormat->wBitsPerSample
+        );
+
+        Log(
+            "  cbSize = %u",
+            pSourceFormat->cbSize
         );
     }
     else
     {
         Log(
-            "ERROR: Could not create config"
+            "Audio format = NULL"
         );
     }
-}
 
-
-g_config.enabled =
-    GetPrivateProfileIntA(
-        "BassBooster",
-        "Enabled",
-        1,
-        g_iniPath.c_str()
-    ) != 0;
-
-
-char buffer[64] = {};
-
-
-GetPrivateProfileStringA(
-    "BassBooster",
-    "BassGainDb",
-    "10.0",
-    buffer,
-    sizeof(buffer),
-    g_iniPath.c_str()
-);
-
-
-g_config.bassGainDb =
-    static_cast<float>(
-        atof(buffer)
-    );
-
-
-GetPrivateProfileStringA(
-    "BassBooster",
-    "CutoffFreq",
-    "100.0",
-    buffer,
-    sizeof(buffer),
-    g_iniPath.c_str()
-);
-
-
-g_config.cutoffFreq =
-    static_cast<float>(
-        atof(buffer)
-    );
-
-
-GetPrivateProfileStringA(
-    "BassBooster",
-    "MasterVolume",
-    "1.0",
-    buffer,
-    sizeof(buffer),
-    g_iniPath.c_str()
-);
-
-
-g_config.masterVolume =
-    static_cast<float>(
-        atof(buffer)
-    );
-
-
-Log(
-    "Configuration:"
-);
-
-
-Log(
-    "  Enabled = %d",
-    g_config.enabled ? 1 : 0
-);
-
-
-Log(
-    "  BassGainDb = %.2f",
-    g_config.bassGainDb
-);
-
-
-Log(
-    "  CutoffFreq = %.2f",
-    g_config.cutoffFreq
-);
-
-
-Log(
-    "  MasterVolume = %.2f",
-    g_config.masterVolume
-);
-
-}
-
-// ============================================================
-// XAudio2Create TYPE
-// ============================================================
-
-typedef HRESULT (WINAPI* XAudio2Create_t)(
-IXAudio2**,
-UINT32,
-XAUDIO2_PROCESSOR
-);
-
-// ============================================================
-// ORIGINAL XAudio2Create
-// ============================================================
-
-static XAudio2Create_t
-g_originalXAudio2Create27 = nullptr;
-
-static XAudio2Create_t
-g_originalXAudio2Create28 = nullptr;
-
-static XAudio2Create_t
-g_originalXAudio2Create29 = nullptr;
-
-// ============================================================
-// XAudio2Create HOOK
-// ============================================================
-
-static HRESULT WINAPI
-HookedXAudio2Create27(
-IXAudio2** ppXAudio2,
-UINT32 Flags,
-XAUDIO2_PROCESSOR Processor
-)
-{
-Log(
-"=============================================="
-);
-
-Log(
-    ">>> XAUDIO2_7: XAudio2Create CALLED"
-);
-
-Log(
-    "Flags = %u",
-    Flags
-);
-
-Log(
-    "Processor = %u",
-    static_cast<unsigned>(
-        Processor
-    )
-);
-
-
-if (!g_originalXAudio2Create27)
-{
-    Log(
-        "ERROR: original XAudio2Create 2.7 is NULL"
-    );
-
-    return E_FAIL;
-}
-
-
-HRESULT result =
-    g_originalXAudio2Create27(
-        ppXAudio2,
-        Flags,
-        Processor
-    );
-
-
-Log(
-    "XAudio2Create result = 0x%08X",
-    static_cast<unsigned>(
-        result
-    )
-);
-
-
-if (SUCCEEDED(result) &&
-    ppXAudio2 &&
-    *ppXAudio2)
-{
-    Log(
-        ">>> IXAudio2 CREATED: %p",
-        static_cast<void*>(*ppXAudio2)
-    );
-}
-else
-{
-    Log(
-        ">>> IXAudio2 creation FAILED"
-    );
-}
-
-
-Log(
-    "=============================================="
-);
-
-
-return result;
-
-}
-
-static HRESULT WINAPI
-HookedXAudio2Create28(
-IXAudio2** ppXAudio2,
-UINT32 Flags,
-XAUDIO2_PROCESSOR Processor
-)
-{
-Log(
-"=============================================="
-);
-
-Log(
-    ">>> XAUDIO2_8: XAudio2Create CALLED"
-);
-
-
-Log(
-    "Flags = %u",
-    Flags
-);
-
-
-Log(
-    "Processor = %u",
-    static_cast<unsigned>(
-        Processor
-    )
-);
-
-
-if (!g_originalXAudio2Create28)
-{
-    Log(
-        "ERROR: original XAudio2Create 2.8 is NULL"
-    );
-
-    return E_FAIL;
-}
-
-
-HRESULT result =
-    g_originalXAudio2Create28(
-        ppXAudio2,
-        Flags,
-        Processor
-    );
-
-
-Log(
-    "XAudio2Create result = 0x%08X",
-    static_cast<unsigned>(
-        result
-    )
-);
-
-
-if (SUCCEEDED(result) &&
-    ppXAudio2 &&
-    *ppXAudio2)
-{
-    Log(
-        ">>> IXAudio2 CREATED: %p",
-        static_cast<void*>(*ppXAudio2)
-    );
-}
-
-
-Log(
-    "=============================================="
-);
-
-
-return result;
-
-}
-
-static HRESULT WINAPI
-HookedXAudio2Create29(
-IXAudio2** ppXAudio2,
-UINT32 Flags,
-XAUDIO2_PROCESSOR Processor
-)
-{
-Log(
-"=============================================="
-);
-
-Log(
-    ">>> XAUDIO2_9: XAudio2Create CALLED"
-);
-
-
-Log(
-    "Flags = %u",
-    Flags
-);
-
-
-Log(
-    "Processor = %u",
-    static_cast<unsigned>(
-        Processor
-    )
-);
-
-
-if (!g_originalXAudio2Create29)
-{
-    Log(
-        "ERROR: original XAudio2Create 2.9 is NULL"
-    );
-
-    return E_FAIL;
-}
-
-
-HRESULT result =
-    g_originalXAudio2Create29(
-        ppXAudio2,
-        Flags,
-        Processor
-    );
-
-
-Log(
-    "XAudio2Create result = 0x%08X",
-    static_cast<unsigned>(
-        result
-    )
-);
-
-
-if (SUCCEEDED(result) &&
-    ppXAudio2 &&
-    *ppXAudio2)
-{
-    Log(
-        ">>> IXAudio2 CREATED: %p",
-        static_cast<void*>(*ppXAudio2)
-    );
-}
-
-
-Log(
-    "=============================================="
-);
-
-
-return result;
-
-}
-
-// ============================================================
-// INSTALL XAudio2Create HOOK
-// ============================================================
-
-static bool InstallXAudioHook(
-const char* dllName
-)
-{
-HMODULE module =
-GetModuleHandleA(
-dllName
-);
-
-if (!module)
-    return false;
-
-
-FARPROC proc =
-    GetProcAddress(
-        module,
-        "XAudio2Create"
-    );
-
-
-if (!proc)
-{
-    Log(
-        "%s loaded but XAudio2Create "
-        "was not exported",
-        dllName
-    );
-
-    return false;
-}
-
-
-Log(
-    "XAudio2Create found:"
-);
-
-
-Log(
-    "  DLL = %s",
-    dllName
-);
-
-
-Log(
-    "  Module = %p",
-    static_cast<void*>(module)
-);
-
-
-Log(
-    "  Function = %p",
-    reinterpret_cast<void*>(proc)
-);
-
-
-LPVOID detour = nullptr;
-LPVOID* original = nullptr;
-
-
-if (_stricmp(
-        dllName,
-        "xaudio2_7.dll"
-    ) == 0)
-{
-    if (g_xaudio27Hooked)
-        return true;
-
-
-    detour =
-        reinterpret_cast<LPVOID>(
-            &HookedXAudio2Create27
-        );
-
-
-    original =
-        reinterpret_cast<LPVOID*>(
-            &g_originalXAudio2Create27
-        );
-}
-
-
-else if (_stricmp(
-             dllName,
-             "xaudio2_8.dll"
-         ) == 0)
-{
-    if (g_xaudio28Hooked)
-        return true;
-
-
-    detour =
-        reinterpret_cast<LPVOID>(
-            &HookedXAudio2Create28
-        );
-
-
-    original =
-        reinterpret_cast<LPVOID*>(
-            &g_originalXAudio2Create28
-        );
-}
-
-
-else if (_stricmp(
-             dllName,
-             "xaudio2_9.dll"
-         ) == 0)
-{
-    if (g_xaudio29Hooked)
-        return true;
-
-
-    detour =
-        reinterpret_cast<LPVOID>(
-            &HookedXAudio2Create29
-        );
-
-
-    original =
-        reinterpret_cast<LPVOID*>(
-            &g_originalXAudio2Create29
-        );
-}
-
-
-else
-{
-    Log(
-        "Unknown XAudio DLL: %s",
-        dllName
-    );
-
-    return false;
-}
-
-
-MH_STATUS status =
-    MH_CreateHook(
-        reinterpret_cast<LPVOID>(
-            proc
-        ),
-        detour,
-        original
-    );
-
-
-if (status != MH_OK)
-{
-    Log(
-        "MH_CreateHook FAILED"
-    );
 
     Log(
-        "Status = %d",
-        static_cast<int>(status)
+        "Flags = 0x%08X",
+        Flags
     );
 
-    return false;
-}
-
-
-status =
-    MH_EnableHook(
-        reinterpret_cast<LPVOID>(
-            proc
-        )
-    );
-
-
-if (status != MH_OK)
-{
-    Log(
-        "MH_EnableHook FAILED"
-    );
 
     Log(
-        "Status = %d",
-        static_cast<int>(status)
+        "MaxFrequencyRatio = %.3f",
+        MaxFrequencyRatio
     );
 
-    return false;
-}
+
+    Log(
+        "Callback = %p",
+        static_cast<void*>(pCallback)
+    );
 
 
-if (_stricmp(
-        dllName,
-        "xaudio2_7.dll"
-    ) == 0)
-{
-    g_xaudio27Hooked = true;
-}
-
-
-if (_stricmp(
-        dllName,
-        "xaudio2_8.dll"
-    ) == 0)
-{
-    g_xaudio28Hooked = true;
-}
-
-
-if (_stricmp(
-        dllName,
-        "xaudio2_9.dll"
-    ) == 0)
-{
-    g_xaudio29Hooked = true;
-}
-
-
-g_xaudioHooked = true;
-
-
-Log(
-    ">>> SUCCESS: %s XAudio2Create HOOK INSTALLED",
-    dllName
-);
-
-
-return true;
-
-}
-
-// ============================================================
-// SCAN ALL XAudio DLLS
-// ============================================================
-
-static void ScanForXAudio()
-{
-static const char* dlls[] =
-{
-"xaudio2_7.dll",
-"xaudio2_8.dll",
-"xaudio2_9.dll"
-};
-
-for (const char* dllName : dlls)
-{
-    HMODULE module =
-        GetModuleHandleA(
-            dllName
-        );
-
-
-    if (module)
+    if (!g_originalCreateSourceVoice)
     {
-        bool alreadyHooked = false;
+        Log(
+            "ERROR: Original CreateSourceVoice NULL"
+        );
+
+        return E_FAIL;
+    }
 
 
-        if (_stricmp(
-                dllName,
-                "xaudio2_7.dll"
-            ) == 0)
+    HRESULT result =
+        g_originalCreateSourceVoice(
+            This,
+            ppSourceVoice,
+            pSourceFormat,
+            Flags,
+            MaxFrequencyRatio,
+            pCallback,
+            pSendList,
+            pEffectChain
+        );
+
+
+    Log(
+        "CreateSourceVoice result = 0x%08X",
+        static_cast<unsigned>(result)
+    );
+
+
+    if (
+        SUCCEEDED(result) &&
+        ppSourceVoice &&
+        *ppSourceVoice
+    )
+    {
+        Log(
+            ">>> NEW SourceVoice = %p",
+            static_cast<void*>(*ppSourceVoice)
+        );
+
+
+        HookSourceVoice(
+            *ppSourceVoice
+        );
+    }
+
+
+    Log(
+        "================================================"
+    );
+
+
+    return result;
+}
+
+
+// ============================================================
+// HOOK IXAudio2
+// ============================================================
+
+static bool HookIXAudio2(
+    IXAudio2* audio
+)
+{
+    if (!audio)
+        return false;
+
+
+    if (g_createSourceVoiceHooked)
+    {
+        Log(
+            "IXAudio2 CreateSourceVoice already hooked"
+        );
+
+        return true;
+    }
+
+
+    void** vtable =
+        *reinterpret_cast<void***>(
+            audio
+        );
+
+
+    if (!vtable)
+    {
+        Log(
+            "ERROR: IXAudio2 vtable NULL"
+        );
+
+        return false;
+    }
+
+
+    void* createSourceVoice =
+        vtable[8];
+
+
+    if (!createSourceVoice)
+    {
+        Log(
+            "ERROR: CreateSourceVoice address NULL"
+        );
+
+        return false;
+    }
+
+
+    Log(
+        "IXAudio2 vtable = %p",
+        static_cast<void*>(vtable)
+    );
+
+
+    Log(
+        "CreateSourceVoice = %p",
+        createSourceVoice
+    );
+
+
+    MH_STATUS status =
+        MH_CreateHook(
+            createSourceVoice,
+            reinterpret_cast<LPVOID>(
+                &HookedCreateSourceVoice
+            ),
+            reinterpret_cast<LPVOID*>(
+                &g_originalCreateSourceVoice
+            )
+        );
+
+
+    if (
+        status != MH_OK &&
+        status != MH_ERROR_ALREADY_CREATED
+    )
+    {
+        Log(
+            "MH_CreateHook CreateSourceVoice failed: %d",
+            static_cast<int>(status)
+        );
+
+        return false;
+    }
+
+
+    status =
+        MH_EnableHook(
+            createSourceVoice
+        );
+
+
+    if (
+        status != MH_OK &&
+        status != MH_ERROR_ENABLED
+    )
+    {
+        Log(
+            "MH_EnableHook CreateSourceVoice failed: %d",
+            static_cast<int>(status)
+        );
+
+        return false;
+    }
+
+
+    g_createSourceVoiceHooked = true;
+
+
+    Log(
+        ">>> SUCCESS: IXAudio2::CreateSourceVoice HOOKED"
+    );
+
+
+    return true;
+}
+
+
+// ============================================================
+// IClassFactory::CreateInstance HOOK
+// ============================================================
+
+static HRESULT STDMETHODCALLTYPE
+HookedFactoryCreateInstance(
+    IClassFactory* This,
+    IUnknown* pUnkOuter,
+    REFIID riid,
+    void** ppvObject
+)
+{
+    Log(
+        "------------------------------------------------"
+    );
+
+    Log(
+        ">>> XAudio2 IClassFactory::CreateInstance"
+    );
+
+    Log(
+        "Factory = %p",
+        static_cast<void*>(This)
+    );
+
+
+    Log(
+        "riid = %08lX-%04X-%04X-...",
+        riid.Data1,
+        riid.Data2,
+        riid.Data3
+    );
+
+
+    HRESULT result =
+        g_originalFactoryCreateInstance(
+            This,
+            pUnkOuter,
+            riid,
+            ppvObject
+        );
+
+
+    Log(
+        "Factory CreateInstance result = 0x%08X",
+        static_cast<unsigned>(result)
+    );
+
+
+    if (
+        SUCCEEDED(result) &&
+        ppvObject &&
+        *ppvObject
+    )
+    {
+        Log(
+            "Factory returned object = %p",
+            *ppvObject
+        );
+
+
+        if (
+            IsEqualGUID(
+                riid,
+                g_IID_IXAudio2
+            )
+        )
         {
-            alreadyHooked =
-                g_xaudio27Hooked;
+            IXAudio2* audio =
+                reinterpret_cast<IXAudio2*>(
+                    *ppvObject
+                );
+
+
+            Log(
+                ">>> IXAudio2 interface received"
+            );
+
+
+            HookIXAudio2(
+                audio
+            );
         }
-
-
-        if (_stricmp(
-                dllName,
-                "xaudio2_8.dll"
-            ) == 0)
-        {
-            alreadyHooked =
-                g_xaudio28Hooked;
-        }
-
-
-        if (_stricmp(
-                dllName,
-                "xaudio2_9.dll"
-            ) == 0)
-        {
-            alreadyHooked =
-                g_xaudio29Hooked;
-        }
-
-
-        if (!alreadyHooked)
+        else
         {
             Log(
-                ">>> XAudio DLL DETECTED: %s",
-                dllName
-            );
-
-
-            InstallXAudioHook(
-                dllName
+                "Returned interface is not IXAudio2"
             );
         }
     }
+
+
+    return result;
 }
 
-}
 
 // ============================================================
-// DLL LOAD HOOK TYPES
+// HOOK IClassFactory
 // ============================================================
 
-typedef HMODULE (WINAPI* LoadLibraryA_t)(
-LPCSTR
-);
-
-typedef HMODULE (WINAPI* LoadLibraryW_t)(
-LPCWSTR
-);
-
-typedef HMODULE (WINAPI* LoadLibraryExA_t)(
-LPCSTR,
-HANDLE,
-DWORD
-);
-
-typedef HMODULE (WINAPI* LoadLibraryExW_t)(
-LPCWSTR,
-HANDLE,
-DWORD
-);
-
-// ============================================================
-// ORIGINAL LOADLIBRARY POINTERS
-// ============================================================
-
-static LoadLibraryA_t
-g_originalLoadLibraryA = nullptr;
-
-static LoadLibraryW_t
-g_originalLoadLibraryW = nullptr;
-
-static LoadLibraryExA_t
-g_originalLoadLibraryExA = nullptr;
-
-static LoadLibraryExW_t
-g_originalLoadLibraryExW = nullptr;
-
-// ============================================================
-// CHECK DLL NAME
-// ============================================================
-
-static bool IsXAudioName(
-const char* name
+static bool HookClassFactory(
+    IClassFactory* factory
 )
 {
-if (!name)
-return false;
-
-std::string s(name);
+    if (!factory)
+        return false;
 
 
-std::transform(
-    s.begin(),
-    s.end(),
-    s.begin(),
-    [](unsigned char c)
+    if (g_factoryCreateInstanceHooked)
     {
-        return static_cast<char>(
-            std::tolower(c)
-        );
+        return true;
     }
-);
 
 
-return
-    s.find("xaudio2_7.dll") != std::string::npos ||
-    s.find("xaudio2_8.dll") != std::string::npos ||
-    s.find("xaudio2_9.dll") != std::string::npos ||
-    s == "xaudio2.dll";
-
-}
-
-// ============================================================
-// LOADLIBRARY A HOOK
-// ============================================================
-
-static HMODULE WINAPI
-HookedLoadLibraryA(
-LPCSTR lpLibFileName
-)
-{
-if (lpLibFileName &&
-IsXAudioName(lpLibFileName))
-{
-Log(
-">>> LoadLibraryA REQUEST: %s",
-lpLibFileName
-);
-}
-
-HMODULE module =
-    g_originalLoadLibraryA(
-        lpLibFileName
-    );
+    void** vtable =
+        *reinterpret_cast<void***>(
+            factory
+        );
 
 
-if (lpLibFileName &&
-    IsXAudioName(lpLibFileName))
-{
+    if (!vtable)
+    {
+        Log(
+            "ERROR: Factory vtable NULL"
+        );
+
+        return false;
+    }
+
+
+    // IUnknown:
+    //
+    // 0 QueryInterface
+    // 1 AddRef
+    // 2 Release
+    //
+    // IClassFactory:
+    //
+    // 3 CreateInstance
+    // 4 LockServer
+
+    void* createInstance =
+        vtable[3];
+
+
+    if (!createInstance)
+    {
+        Log(
+            "ERROR: Factory CreateInstance NULL"
+        );
+
+        return false;
+    }
+
+
     Log(
-        ">>> LoadLibraryA RESULT: %p",
-        static_cast<void*>(module)
+        "IClassFactory vtable = %p",
+        static_cast<void*>(vtable)
     );
 
 
-    if (module)
+    Log(
+        "IClassFactory::CreateInstance = %p",
+        createInstance
+    );
+
+
+    MH_STATUS status =
+        MH_CreateHook(
+            createInstance,
+            reinterpret_cast<LPVOID>(
+                &HookedFactoryCreateInstance
+            ),
+            reinterpret_cast<LPVOID*>(
+                &g_originalFactoryCreateInstance
+            )
+        );
+
+
+    if (
+        status != MH_OK &&
+        status != MH_ERROR_ALREADY_CREATED
+    )
     {
-        // Give the loader a moment to finish
-        // initializing the DLL.
+        Log(
+            "MH_CreateHook Factory CreateInstance failed: %d",
+            static_cast<int>(status)
+        );
 
-        Sleep(10);
-
-        ScanForXAudio();
+        return false;
     }
+
+
+    status =
+        MH_EnableHook(
+            createInstance
+        );
+
+
+    if (
+        status != MH_OK &&
+        status != MH_ERROR_ENABLED
+    )
+    {
+        Log(
+            "MH_EnableHook Factory CreateInstance failed: %d",
+            static_cast<int>(status)
+        );
+
+        return false;
+    }
+
+
+    g_factoryCreateInstanceHooked = true;
+
+
+    Log(
+        ">>> SUCCESS: XAudio2 IClassFactory::CreateInstance HOOKED"
+    );
+
+
+    return true;
 }
 
 
-return module;
-
-}
-
 // ============================================================
-// LOADLIBRARY W HOOK
+// DllGetClassObject HOOK
 // ============================================================
 
-static HMODULE WINAPI
-HookedLoadLibraryW(
-LPCWSTR lpLibFileName
+static HRESULT WINAPI
+HookedDllGetClassObject(
+    REFCLSID rclsid,
+    REFIID riid,
+    LPVOID* ppv
 )
 {
-HMODULE module =
-g_originalLoadLibraryW(
-lpLibFileName
-);
-
-if (lpLibFileName)
-{
-    char name[512] = {};
+    bool isXAudioClass =
+        IsEqualGUID(
+            rclsid,
+            g_CLSID_XAudio2
+        );
 
 
-    WideCharToMultiByte(
-        CP_ACP,
-        0,
-        lpLibFileName,
-        -1,
-        name,
-        sizeof(name),
-        nullptr,
-        nullptr
-    );
-
-
-    if (IsXAudioName(name))
+    if (isXAudioClass)
     {
         Log(
-            ">>> LoadLibraryW XAudio: %s",
-            name
+            "================================================"
         );
-
 
         Log(
-            ">>> Module = %p",
-            static_cast<void*>(module)
+            ">>> xaudio2_7.dll DllGetClassObject"
+        );
+
+        Log(
+            ">>> XAudio2 CLSID requested"
+        );
+    }
+
+
+    if (!g_originalDllGetClassObject)
+    {
+        Log(
+            "ERROR: Original DllGetClassObject NULL"
+        );
+
+        return E_FAIL;
+    }
+
+
+    HRESULT result =
+        g_originalDllGetClassObject(
+            rclsid,
+            riid,
+            ppv
         );
 
 
-        if (module)
+    if (isXAudioClass)
+    {
+        Log(
+            "DllGetClassObject result = 0x%08X",
+            static_cast<unsigned>(result)
+        );
+
+
+        if (
+            SUCCEEDED(result) &&
+            ppv &&
+            *ppv
+        )
         {
-            Sleep(10);
+            Log(
+                "Class factory object = %p",
+                *ppv
+            );
 
-            ScanForXAudio();
+
+            IClassFactory* factory =
+                reinterpret_cast<IClassFactory*>(
+                    *ppv
+                );
+
+
+            HookClassFactory(
+                factory
+            );
         }
-    }
-}
-
-
-return module;
-
-}
-
-// ============================================================
-// LOADLIBRARYEX A HOOK
-// ============================================================
-
-static HMODULE WINAPI
-HookedLoadLibraryExA(
-LPCSTR lpLibFileName,
-HANDLE hFile,
-DWORD dwFlags
-)
-{
-if (lpLibFileName &&
-IsXAudioName(lpLibFileName))
-{
-Log(
-">>> LoadLibraryExA REQUEST: %s",
-lpLibFileName
-);
-}
-
-HMODULE module =
-    g_originalLoadLibraryExA(
-        lpLibFileName,
-        hFile,
-        dwFlags
-    );
-
-
-if (lpLibFileName &&
-    IsXAudioName(lpLibFileName))
-{
-    Log(
-        ">>> LoadLibraryExA RESULT: %p",
-        static_cast<void*>(module)
-    );
-
-
-    if (module)
-    {
-        Sleep(10);
-
-        ScanForXAudio();
-    }
-}
-
-
-return module;
-
-}
-
-// ============================================================
-// LOADLIBRARYEX W HOOK
-// ============================================================
-
-static HMODULE WINAPI
-HookedLoadLibraryExW(
-LPCWSTR lpLibFileName,
-HANDLE hFile,
-DWORD dwFlags
-)
-{
-HMODULE module =
-g_originalLoadLibraryExW(
-lpLibFileName,
-hFile,
-dwFlags
-);
-
-if (lpLibFileName)
-{
-    char name[512] = {};
-
-
-    WideCharToMultiByte(
-        CP_ACP,
-        0,
-        lpLibFileName,
-        -1,
-        name,
-        sizeof(name),
-        nullptr,
-        nullptr
-    );
-
-
-    if (IsXAudioName(name))
-    {
-        Log(
-            ">>> LoadLibraryExW XAudio: %s",
-            name
-        );
-
-
-        Log(
-            ">>> Module = %p",
-            static_cast<void*>(module)
-        );
-
-
-        if (module)
+        else
         {
-            Sleep(10);
-
-            ScanForXAudio();
+            Log(
+                ">>> DllGetClassObject returned no factory"
+            );
         }
+
+
+        Log(
+            "================================================"
+        );
     }
+
+
+    return result;
 }
 
 
-return module;
-
-}
-
 // ============================================================
-// INSTALL LOADLIBRARY HOOKS
+// INSTALL DllGetClassObject HOOK
 // ============================================================
 
-static void InstallLoadLibraryHooks()
+static bool InstallDllGetClassObjectHook()
 {
-HMODULE kernel32 =
-GetModuleHandleA(
-"kernel32.dll"
-);
+    if (g_dllGetClassObjectHooked)
+        return true;
 
-if (!kernel32)
-{
+
+    HMODULE xaudio =
+        GetModuleHandleA(
+            "xaudio2_7.dll"
+        );
+
+
+    if (!xaudio)
+    {
+        Log(
+            "xaudio2_7.dll not loaded"
+        );
+
+        return false;
+    }
+
+
     Log(
-        "ERROR: kernel32.dll not found"
-    );
-
-    return;
-}
-
-
-// --------------------------------------------------------
-// LoadLibraryA
-// --------------------------------------------------------
-
-FARPROC loadA =
-    GetProcAddress(
-        kernel32,
-        "LoadLibraryA"
+        ">>> xaudio2_7.dll module = %p",
+        static_cast<void*>(xaudio)
     );
 
 
-if (loadA)
-{
+    FARPROC proc =
+        GetProcAddress(
+            xaudio,
+            "DllGetClassObject"
+        );
+
+
+    if (!proc)
+    {
+        Log(
+            "ERROR: xaudio2_7.dll does NOT export DllGetClassObject"
+        );
+
+        return false;
+    }
+
+
+    Log(
+        "DllGetClassObject = %p",
+        reinterpret_cast<void*>(proc)
+    );
+
+
     MH_STATUS status =
         MH_CreateHook(
             reinterpret_cast<LPVOID>(
-                loadA
+                proc
+            ),
+            reinterpret_cast<LPVOID>(
+                &HookedDllGetClassObject
+            ),
+            reinterpret_cast<LPVOID*>(
+                &g_originalDllGetClassObject
+            )
+        );
+
+
+    Log(
+        "DllGetClassObject MH_CreateHook = %d",
+        static_cast<int>(status)
+    );
+
+
+    if (
+        status != MH_OK &&
+        status != MH_ERROR_ALREADY_CREATED
+    )
+    {
+        return false;
+    }
+
+
+    status =
+        MH_EnableHook(
+            reinterpret_cast<LPVOID>(
+                proc
+            )
+        );
+
+
+    Log(
+        "DllGetClassObject MH_EnableHook = %d",
+        static_cast<int>(status)
+    );
+
+
+    if (
+        status != MH_OK &&
+        status != MH_ERROR_ENABLED
+    )
+    {
+        return false;
+    }
+
+
+    g_dllGetClassObjectHooked = true;
+
+
+    Log(
+        ">>> SUCCESS: xaudio2_7.dll DllGetClassObject HOOKED"
+    );
+
+
+    return true;
+}
+
+
+// ============================================================
+// XAudio DLL DETECTION
+// ============================================================
+
+static void CheckXAudioModule()
+{
+    if (g_dllGetClassObjectHooked)
+        return;
+
+
+    HMODULE xaudio =
+        GetModuleHandleA(
+            "xaudio2_7.dll"
+        );
+
+
+    if (!xaudio)
+        return;
+
+
+    if (!g_xaudioDllDetected)
+    {
+        g_xaudioDllDetected = true;
+
+
+        Log(
+            "================================================"
+        );
+
+
+        Log(
+            ">>> XAudio2_7 DLL DETECTED"
+        );
+
+
+        Log(
+            "Module = %p",
+            static_cast<void*>(xaudio)
+        );
+
+
+        Log(
+            "Attempting LOCAL DllGetClassObject hook..."
+        );
+
+
+        InstallDllGetClassObjectHook();
+
+
+        Log(
+            "================================================"
+        );
+    }
+}
+
+
+// ============================================================
+// LoadLibraryA MONITOR
+// ============================================================
+
+typedef HMODULE (WINAPI* LoadLibraryA_t)(
+    LPCSTR
+);
+
+static LoadLibraryA_t
+    g_originalLoadLibraryA = nullptr;
+
+
+static bool IsXAudioName(
+    const char* name
+)
+{
+    if (!name)
+        return false;
+
+
+    std::string s(name);
+
+
+    std::transform(
+        s.begin(),
+        s.end(),
+        s.begin(),
+        [](unsigned char c)
+        {
+            return static_cast<char>(
+                std::tolower(c)
+            );
+        }
+    );
+
+
+    return
+        s.find("xaudio2_7.dll") !=
+        std::string::npos;
+}
+
+
+static HMODULE WINAPI
+HookedLoadLibraryA(
+    LPCSTR lpLibFileName
+)
+{
+    if (
+        lpLibFileName &&
+        IsXAudioName(lpLibFileName)
+    )
+    {
+        Log(
+            ">>> LoadLibraryA REQUEST: %s",
+            lpLibFileName
+        );
+    }
+
+
+    HMODULE module =
+        g_originalLoadLibraryA(
+            lpLibFileName
+        );
+
+
+    if (
+        lpLibFileName &&
+        IsXAudioName(lpLibFileName)
+    )
+    {
+        Log(
+            ">>> LoadLibraryA RESULT: %p",
+            static_cast<void*>(module)
+        );
+
+
+        if (module)
+        {
+            Sleep(5);
+
+            CheckXAudioModule();
+        }
+    }
+
+
+    return module;
+}
+
+
+// ============================================================
+// INSTALL LoadLibraryA HOOK
+// ============================================================
+
+static void InstallLoadLibraryHook()
+{
+    HMODULE kernel32 =
+        GetModuleHandleA(
+            "kernel32.dll"
+        );
+
+
+    if (!kernel32)
+    {
+        Log(
+            "ERROR: kernel32.dll not found"
+        );
+
+        return;
+    }
+
+
+    FARPROC proc =
+        GetProcAddress(
+            kernel32,
+            "LoadLibraryA"
+        );
+
+
+    if (!proc)
+    {
+        Log(
+            "ERROR: LoadLibraryA not found"
+        );
+
+        return;
+    }
+
+
+    MH_STATUS status =
+        MH_CreateHook(
+            reinterpret_cast<LPVOID>(
+                proc
             ),
             reinterpret_cast<LPVOID>(
                 &HookedLoadLibraryA
@@ -1208,7 +1593,7 @@ if (loadA)
         status =
             MH_EnableHook(
                 reinterpret_cast<LPVOID>(
-                    loadA
+                    proc
                 )
             );
 
@@ -1221,423 +1606,250 @@ if (loadA)
 }
 
 
-// --------------------------------------------------------
-// LoadLibraryW
-// --------------------------------------------------------
-
-FARPROC loadW =
-    GetProcAddress(
-        kernel32,
-        "LoadLibraryW"
-    );
-
-
-if (loadW)
-{
-    MH_STATUS status =
-        MH_CreateHook(
-            reinterpret_cast<LPVOID>(
-                loadW
-            ),
-            reinterpret_cast<LPVOID>(
-                &HookedLoadLibraryW
-            ),
-            reinterpret_cast<LPVOID*>(
-                &g_originalLoadLibraryW
-            )
-        );
-
-
-    Log(
-        "LoadLibraryW hook create = %d",
-        static_cast<int>(status)
-    );
-
-
-    if (status == MH_OK)
-    {
-        status =
-            MH_EnableHook(
-                reinterpret_cast<LPVOID>(
-                    loadW
-                )
-            );
-
-
-        Log(
-            "LoadLibraryW hook enable = %d",
-            static_cast<int>(status)
-        );
-    }
-}
-
-
-// --------------------------------------------------------
-// LoadLibraryExA
-// --------------------------------------------------------
-
-FARPROC loadExA =
-    GetProcAddress(
-        kernel32,
-        "LoadLibraryExA"
-    );
-
-
-if (loadExA)
-{
-    MH_STATUS status =
-        MH_CreateHook(
-            reinterpret_cast<LPVOID>(
-                loadExA
-            ),
-            reinterpret_cast<LPVOID>(
-                &HookedLoadLibraryExA
-            ),
-            reinterpret_cast<LPVOID*>(
-                &g_originalLoadLibraryExA
-            )
-        );
-
-
-    Log(
-        "LoadLibraryExA hook create = %d",
-        static_cast<int>(status)
-    );
-
-
-    if (status == MH_OK)
-    {
-        status =
-            MH_EnableHook(
-                reinterpret_cast<LPVOID>(
-                    loadExA
-                )
-            );
-
-
-        Log(
-            "LoadLibraryExA hook enable = %d",
-            static_cast<int>(status)
-        );
-    }
-}
-
-
-// --------------------------------------------------------
-// LoadLibraryExW
-// --------------------------------------------------------
-
-FARPROC loadExW =
-    GetProcAddress(
-        kernel32,
-        "LoadLibraryExW"
-    );
-
-
-if (loadExW)
-{
-    MH_STATUS status =
-        MH_CreateHook(
-            reinterpret_cast<LPVOID>(
-                loadExW
-            ),
-            reinterpret_cast<LPVOID>(
-                &HookedLoadLibraryExW
-            ),
-            reinterpret_cast<LPVOID*>(
-                &g_originalLoadLibraryExW
-            )
-        );
-
-
-    Log(
-        "LoadLibraryExW hook create = %d",
-        static_cast<int>(status)
-    );
-
-
-    if (status == MH_OK)
-    {
-        status =
-            MH_EnableHook(
-                reinterpret_cast<LPVOID>(
-                    loadExW
-                )
-            );
-
-
-        Log(
-            "LoadLibraryExW hook enable = %d",
-            static_cast<int>(status)
-        );
-    }
-}
-
-
-Log(
-    "LoadLibrary hook initialization finished."
-);
-
-}
-
 // ============================================================
-// BACKGROUND XAudio SCANNER
+// BACKGROUND SCANNER
 // ============================================================
 
 static DWORD WINAPI
-XAudioScannerThread(
-LPVOID
+ScannerThread(
+    LPVOID
 )
-{
-Log(
-"XAudio background scanner started."
-);
-
-while (g_running)
-{
-    ScanForXAudio();
-
-    Sleep(250);
-}
-
-
-Log(
-    "XAudio background scanner stopped."
-);
-
-
-return 0;
-
-}
-
-// ============================================================
-// INITIALIZATION THREAD
-// ============================================================
-
-static DWORD WINAPI
-InitThread(
-LPVOID
-)
-{
-// --------------------------------------------------------
-// Paths
-// --------------------------------------------------------
-
-InitializePaths();
-
-
-// --------------------------------------------------------
-// Fresh log
-// --------------------------------------------------------
-
-DeleteFileA(
-    g_logPath.c_str()
-);
-
-
-Log(
-    "================================================"
-);
-
-Log(
-    "       BASS BOOST ASI STARTING"
-);
-
-Log(
-    "================================================"
-);
-
-
-Log(
-    "Game executable directory:"
-);
-
-
-Log(
-    "%s",
-    g_gameDirectory.c_str()
-);
-
-
-Log(
-    "Log:"
-);
-
-
-Log(
-    "%s",
-    g_logPath.c_str()
-);
-
-
-Log(
-    "Config:"
-);
-
-
-Log(
-    "%s",
-    g_iniPath.c_str()
-);
-
-
-// --------------------------------------------------------
-// Config
-// --------------------------------------------------------
-
-LoadOrGenerateConfig();
-
-
-// --------------------------------------------------------
-// MinHook
-// --------------------------------------------------------
-
-Log(
-    "Initializing MinHook..."
-);
-
-
-MH_STATUS status =
-    MH_Initialize();
-
-
-Log(
-    "MH_Initialize = %d",
-    static_cast<int>(status)
-);
-
-
-if (status != MH_OK &&
-    status != MH_ERROR_ALREADY_INITIALIZED)
 {
     Log(
-        "ERROR: MinHook initialization failed."
+        "XAudio module scanner started."
     );
+
+
+    while (g_running)
+    {
+        CheckXAudioModule();
+
+        Sleep(100);
+    }
+
+
+    Log(
+        "XAudio module scanner stopped."
+    );
+
 
     return 0;
 }
 
 
-// --------------------------------------------------------
-// Install LoadLibrary monitoring
-// --------------------------------------------------------
-
-InstallLoadLibraryHooks();
-
-
-// --------------------------------------------------------
-// Scan immediately
-// --------------------------------------------------------
-
-Log(
-    "Performing initial XAudio scan..."
-);
-
-
-ScanForXAudio();
-
-
-// --------------------------------------------------------
-// Start background scanner
-// --------------------------------------------------------
-
-HANDLE scanner =
-    CreateThread(
-        nullptr,
-        0,
-        XAudioScannerThread,
-        nullptr,
-        0,
-        nullptr
-    );
-
-
-if (scanner)
-{
-    CloseHandle(scanner);
-}
-else
-{
-    Log(
-        "ERROR: Could not create XAudio scanner thread."
-    );
-}
-
-
-// --------------------------------------------------------
-// Finished
-// --------------------------------------------------------
-
-Log(
-    "================================================"
-);
-
-Log(
-    "Initialization complete."
-);
-
-Log(
-    "Waiting for Skyrim to load XAudio..."
-);
-
-Log(
-    "================================================"
-);
-
-
-return 0;
-
-}
-
 // ============================================================
-// DLL MAIN
+// INITIALIZATION
 // ============================================================
 
-BOOL APIENTRY DllMain(
-HMODULE hModule,
-DWORD reason,
-LPVOID
+static DWORD WINAPI
+InitThread(
+    LPVOID
 )
 {
-if (reason ==
-DLL_PROCESS_ATTACH)
-{
-g_module = hModule;
+    InitializePaths();
 
-    DisableThreadLibraryCalls(
-        hModule
+
+    DeleteFileA(
+        g_logPath.c_str()
     );
 
 
-    HANDLE thread =
+    Log(
+        "================================================"
+    );
+
+    Log(
+        "       BASS BOOST ASI STARTING"
+    );
+
+    Log(
+        "================================================"
+    );
+
+
+    Log(
+        "Game directory:"
+    );
+
+    Log(
+        "%s",
+        g_gameDirectory.c_str()
+    );
+
+
+    Log(
+        "Log:"
+    );
+
+    Log(
+        "%s",
+        g_logPath.c_str()
+    );
+
+
+    Log(
+        "Config:"
+    );
+
+    Log(
+        "%s",
+        g_iniPath.c_str()
+    );
+
+
+    LoadOrGenerateConfig();
+
+
+    // --------------------------------------------------------
+    // MinHook
+    // --------------------------------------------------------
+
+    Log(
+        "Initializing MinHook..."
+    );
+
+
+    MH_STATUS status =
+        MH_Initialize();
+
+
+    Log(
+        "MH_Initialize = %d",
+        static_cast<int>(status)
+    );
+
+
+    if (
+        status != MH_OK &&
+        status != MH_ERROR_ALREADY_INITIALIZED
+    )
+    {
+        Log(
+            "ERROR: MinHook initialization failed"
+        );
+
+        return 0;
+    }
+
+
+    // --------------------------------------------------------
+    // Install LoadLibrary monitor
+    // --------------------------------------------------------
+
+    InstallLoadLibraryHook();
+
+
+    // --------------------------------------------------------
+    // Check immediately
+    // --------------------------------------------------------
+
+    CheckXAudioModule();
+
+
+    // --------------------------------------------------------
+    // Background scanner
+    // --------------------------------------------------------
+
+    HANDLE scanner =
         CreateThread(
             nullptr,
             0,
-            InitThread,
+            ScannerThread,
             nullptr,
             0,
             nullptr
         );
 
 
-    if (thread)
+    if (scanner)
     {
-        CloseHandle(thread);
+        CloseHandle(scanner);
     }
+    else
+    {
+        Log(
+            "ERROR: Could not create scanner thread"
+        );
+    }
+
+
+    Log(
+        "================================================"
+    );
+
+    Log(
+        "Initialization complete."
+    );
+
+    Log(
+        "Waiting for Wine xaudio2_7 COM factory..."
+    );
+
+    Log(
+        "CoCreateInstance is NOT hooked."
+    );
+
+    Log(
+        "================================================"
+    );
+
+
+    return 0;
 }
 
 
-else if (reason ==
-         DLL_PROCESS_DETACH)
+// ============================================================
+// DLL MAIN
+// ============================================================
+
+BOOL APIENTRY DllMain(
+    HMODULE hModule,
+    DWORD reason,
+    LPVOID
+)
 {
-    g_running = false;
+    if (
+        reason ==
+        DLL_PROCESS_ATTACH
+    )
+    {
+        g_module =
+            hModule;
 
-    MH_Uninitialize();
+
+        DisableThreadLibraryCalls(
+            hModule
+        );
+
+
+        HANDLE thread =
+            CreateThread(
+                nullptr,
+                0,
+                InitThread,
+                nullptr,
+                0,
+                nullptr
+            );
+
+
+        if (thread)
+        {
+            CloseHandle(thread);
+        }
+    }
+
+
+    else if (
+        reason ==
+        DLL_PROCESS_DETACH
+    )
+    {
+        g_running = false;
+
+        MH_Uninitialize();
+    }
+
+
+    return TRUE;
 }
-
-
-return TRUE;
-
-}
-
-

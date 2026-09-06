@@ -1,21 +1,15 @@
 #include <windows.h>
 #include <mmeapi.h>
-#include <audioclient.h>
-#include <mmdeviceapi.h>
 #include <cmath>
 #include <fstream>
 #include <string>
 #include "MinHook.h"
 
-#ifndef AUDCLNT_BUFFERFLAGS_SILENT
-#define AUDCLNT_BUFFERFLAGS_SILENT 0x2
-#endif
-
 struct Config {
     bool enabled = true;
     float bassGainDb = 10.0f;
     float cutoffFreq = 100.0f;
-    float masterVolume = 0.2f; // Low volume for instant audio test
+    float masterVolume = 0.2f;
 } g_config;
 
 struct BiquadFilter {
@@ -80,109 +74,45 @@ void LoadOrGenerateConfig() {
     g_filter.SetupLowShelf(44100.0f, g_config.cutoffFreq, g_config.bassGainDb);
 }
 
-void ProcessPCMFloat(float* pSamples, DWORD sampleCount) {
+// Inline audio processor for 16-bit PCM (WinMM)
+void ProcessPCM16(short* pSamples, DWORD sampleCount) {
     if (!g_config.enabled || !pSamples || sampleCount == 0) return;
 
     for (DWORD i = 0; i < sampleCount; ++i) {
-        float sampleFloat = pSamples[i];
+        float sampleFloat = static_cast<float>(pSamples[i]);
         float processed = g_filter.Process(sampleFloat, i % 2);
         processed *= g_config.masterVolume;
 
-        if (processed > 1.0f) processed = 1.0f;
-        if (processed < -1.0f) processed = -1.0f;
+        if (processed > 32767.0f) processed = 32767.0f;
+        if (processed < -32768.0f) processed = -32768.0f;
 
-        pSamples[i] = processed;
+        pSamples[i] = static_cast<short>(processed);
     }
 }
 
-// WASAPI Hooks
-typedef HRESULT (STDMETHODCALLTYPE *pfnReleaseBuffer)(IAudioRenderClient* pThis, UINT32 NumFramesWritten, DWORD dwFlags);
-pfnReleaseBuffer g_OriginalReleaseBuffer = nullptr;
+// Hook winmm.dll (waveOutWrite) safely
+typedef MMRESULT (WINAPI *pfnWaveOutWrite)(HWAVEOUT hwo, LPWAVEHDR pwh, UINT cbwh);
+pfnWaveOutWrite g_OriginalWaveOutWrite = nullptr;
 
-thread_local BYTE* t_pAudioBuffer = nullptr;
-
-typedef HRESULT (STDMETHODCALLTYPE *pfnGetBuffer)(IAudioRenderClient* pThis, UINT32 NumFramesRequested, BYTE** ppData);
-pfnGetBuffer g_OriginalGetBuffer = nullptr;
-
-HRESULT STDMETHODCALLTYPE HookedGetBuffer(IAudioRenderClient* pThis, UINT32 NumFramesRequested, BYTE** ppData) {
-    HRESULT hr = g_OriginalGetBuffer(pThis, NumFramesRequested, ppData);
-    if (SUCCEEDED(hr) && ppData) {
-        t_pAudioBuffer = *ppData;
+MMRESULT WINAPI HookedWaveOutWrite(HWAVEOUT hwo, LPWAVEHDR pwh, UINT cbwh) {
+    if (pwh && pwh->lpData && pwh->dwBufferLength > 0) {
+        ProcessPCM16(reinterpret_cast<short*>(pwh->lpData), pwh->dwBufferLength / sizeof(short));
     }
-    return hr;
+    return g_OriginalWaveOutWrite(hwo, pwh, cbwh);
 }
 
-HRESULT STDMETHODCALLTYPE HookedReleaseBuffer(IAudioRenderClient* pThis, UINT32 NumFramesWritten, DWORD dwFlags) {
-    if (t_pAudioBuffer && NumFramesWritten > 0 && !(dwFlags & AUDCLNT_BUFFERFLAGS_SILENT)) {
-        DWORD sampleCount = NumFramesWritten * 2;
-        ProcessPCMFloat(reinterpret_cast<float*>(t_pAudioBuffer), sampleCount);
-    }
-    t_pAudioBuffer = nullptr;
-    return g_OriginalReleaseBuffer(pThis, NumFramesWritten, dwFlags);
-}
+void InitHooks() {
+    if (MH_Initialize() != MH_OK) return;
 
-// Hook IAudioClient::GetService to grab IAudioRenderClient VTable dynamically
-typedef HRESULT (STDMETHODCALLTYPE *pfnGetService)(IAudioClient* pThis, REFIID riid, void** ppv);
-pfnGetService g_OriginalGetService = nullptr;
+    // Safely hook WinMM without touching COM or system-wide routines
+    HMODULE hWinMM = GetModuleHandleA("winmm.dll");
+    if (!hWinMM) hWinMM = LoadLibraryA("winmm.dll");
 
-HRESULT STDMETHODCALLTYPE HookedGetService(IAudioClient* pThis, REFIID riid, void** ppv) {
-    HRESULT hr = g_OriginalGetService(pThis, riid, ppv);
-    if (SUCCEEDED(hr) && ppv && *ppv) {
-        if (riid == __uuidof(IAudioRenderClient)) {
-            IAudioRenderClient* pRenderClient = static_cast<IAudioRenderClient*>(*ppv);
-            void** vtable = *reinterpret_cast<void***>(pRenderClient);
-            
-            if (vtable && !g_OriginalReleaseBuffer) {
-                // GetBuffer is VTable slot 3, ReleaseBuffer is VTable slot 4
-                MH_CreateHook(vtable[3], (LPVOID)&HookedGetBuffer, (LPVOID*)&g_OriginalGetBuffer);
-                MH_CreateHook(vtable[4], (LPVOID)&HookedReleaseBuffer, (LPVOID*)&g_OriginalReleaseBuffer);
-                MH_EnableHook(vtable[3]);
-                MH_EnableHook(vtable[4]);
-            }
-        }
-    }
-    return hr;
-}
-
-// CoCreateInstance Hook to capture WASAPI MMDeviceEnumerator creation
-typedef HRESULT (WINAPI *pfnCoCreateInstance)(REFCLSID rclsid, LPUNKNOWN pUnkOuter, DWORD dwClsContext, REFIID riid, LPVOID *ppv);
-pfnCoCreateInstance g_OriginalCoCreateInstance = nullptr;
-
-HRESULT WINAPI HookedCoCreateInstance(REFCLSID rclsid, LPUNKNOWN pUnkOuter, DWORD dwClsContext, REFIID riid, LPVOID *ppv) {
-    HRESULT hr = g_OriginalCoCreateInstance(rclsid, pUnkOuter, dwClsContext, riid, ppv);
-    if (SUCCEEDED(hr) && ppv && *ppv) {
-        if (rclsid == __uuidof(MMDeviceEnumerator)) {
-            IMMDeviceEnumerator* pEnumerator = static_cast<IMMDeviceEnumerator*>(*ppv);
-            IMMDevice* pDevice = nullptr;
-            if (SUCCEEDED(pEnumerator->GetDefaultAudioEndpoint(eRender, eConsole, &pDevice)) && pDevice) {
-                IAudioClient* pAudioClient = nullptr;
-                if (SUCCEEDED(pDevice->Activate(__uuidof(IAudioClient), CLSCTX_ALL, NULL, (void**)&pAudioClient)) && pAudioClient) {
-                    void** vtable = *reinterpret_cast<void***>(pAudioClient);
-                    if (vtable && !g_OriginalGetService) {
-                        // GetService is VTable slot 14 in IAudioClient
-                        MH_CreateHook(vtable[14], (LPVOID)&HookedGetService, (LPVOID*)&g_OriginalGetService);
-                        MH_EnableHook(vtable[14]);
-                    }
-                    pAudioClient->Release();
-                }
-                pDevice->Release();
-            }
-        }
-    }
-    return hr;
-}
-
-void InitUniversalHooks() {
-    MH_Initialize();
-
-    HMODULE hOle32 = GetModuleHandleA("ole32.dll");
-    if (!hOle32) hOle32 = LoadLibraryA("ole32.dll");
-
-    if (hOle32) {
-        void* pCoCreateInstance = (void*)GetProcAddress(hOle32, "CoCreateInstance");
-        if (pCoCreateInstance) {
-            MH_CreateHook(pCoCreateInstance, (LPVOID)&HookedCoCreateInstance, (LPVOID*)&g_OriginalCoCreateInstance);
-            MH_EnableHook(pCoCreateInstance);
+    if (hWinMM) {
+        void* pWaveOutWrite = (void*)GetProcAddress(hWinMM, "waveOutWrite");
+        if (pWaveOutWrite) {
+            MH_CreateHook(pWaveOutWrite, (LPVOID)&HookedWaveOutWrite, (LPVOID*)&g_OriginalWaveOutWrite);
+            MH_EnableHook(pWaveOutWrite);
         }
     }
 }
@@ -191,7 +121,9 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserv
     if (ul_reason_for_call == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(hModule);
         LoadOrGenerateConfig();
-        InitUniversalHooks();
+        InitHooks();
+    } else if (ul_reason_for_call == DLL_PROCESS_DETACH) {
+        MH_Uninitialize();
     }
     return TRUE;
 }

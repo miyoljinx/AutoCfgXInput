@@ -4,7 +4,7 @@ project(BassBoosterPlugin CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Download or include MinHook
+# Fetch MinHook from GitHub
 include(FetchContent)
 FetchContent_Declare(
     minhook
@@ -21,5 +21,9 @@ set_target_properties(BassBooster PROPERTIES
     OUTPUT_NAME "BassBooster"
 )
 
-target_link_libraries(BassBooster PRIVATE minhook dsound winmm)
+# Include MinHook headers and link static library
+target_include_directories(BassBooster PRIVATE ${minhook_SOURCE_DIR}/include)
+target_link_libraries(BassBooster PRIVATE minhook winmm)
+
+# Statically link C/C++ runtimes to avoid missing DLL errors in Wine
 target_link_options(BassBooster PRIVATE -static -static-libgcc -static-libstdc++)

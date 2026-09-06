@@ -21,9 +21,9 @@ set_target_properties(BassBooster PROPERTIES
     OUTPUT_NAME "BassBooster"
 )
 
-# Include MinHook headers and link static library
+# Include MinHook headers and link target
 target_include_directories(BassBooster PRIVATE ${minhook_SOURCE_DIR}/include)
-target_link_libraries(BassBooster PRIVATE minhook winmm)
+target_link_libraries(BassBooster PRIVATE MinHook::MinHook winmm)
 
 # Statically link C/C++ runtimes to avoid missing DLL errors in Wine
 target_link_options(BassBooster PRIVATE -static -static-libgcc -static-libstdc++)

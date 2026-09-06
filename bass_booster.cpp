@@ -55,8 +55,7 @@ static std::atomic<bool> g_xaudioHooked(false);
 
 static void Log(const char* format, ...)
 {
-std::lock_guard"std::mutex" (std::mutex) lock(g_logMutex);
-
+std::lock_guard<std::mutex> lock(g_logMutex);
 FILE* file =
     fopen(
         g_logPath.c_str(),

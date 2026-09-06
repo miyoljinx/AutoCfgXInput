@@ -6,6 +6,11 @@
 #include <string>
 #include "MinHook.h"
 
+// Fallback definition for MinGW compatibility
+#ifndef AUDCLNT_BUFFERFLAGS_SILENT
+#define AUDCLNT_BUFFERFLAGS_SILENT 0x2
+#endif
+
 // Configuration Parameters
 struct Config {
     bool enabled = true;
@@ -34,7 +39,7 @@ struct BiquadFilter {
         float a0 = (A + 1.0f) + (A - 1.0f) * cosw0 + beta * alpha;
         b0 = (A * ((A + 1.0f) - (A - 1.0f) * cosw0 + beta * alpha)) / a0;
         b1 = (2.0f * A * ((A - 1.0f) - (A + 1.0f) * cosw0)) / a0;
-        b2 = (A * ((A + 1.0f) + (A - 1.0f) * cosw0 - beta * alpha)) / a0;
+        b2 = (A * ((A + 1.0f) - (A - 1.0f) * cosw0 - beta * alpha)) / a0;
         a1 = (-2.0f * ((A - 1.0f) + (A + 1.0f) * cosw0)) / a0;
         a2 = ((A + 1.0f) + (A - 1.0f) * cosw0 - beta * alpha) / a0;
     }
@@ -77,7 +82,7 @@ void LoadOrGenerateConfig() {
     g_filter.SetupLowShelf(44100.0f, g_config.cutoffFreq, g_config.bassGainDb);
 }
 
-// DSP processing engine for 16-bit PCM buffers
+// DSP processing engine for 16-bit PCM buffers (DirectSound / WinMM)
 void ProcessPCM16(short* pSamples, DWORD sampleCount) {
     if (!g_config.enabled || !pSamples || sampleCount == 0) return;
 
@@ -93,7 +98,7 @@ void ProcessPCM16(short* pSamples, DWORD sampleCount) {
     }
 }
 
-// DSP processing engine for 32-bit Float PCM buffers (used by XAudio2 / WASAPI)
+// DSP processing engine for 32-bit Float PCM buffers (WASAPI / XAudio2)
 void ProcessPCMFloat(float* pSamples, DWORD sampleCount) {
     if (!g_config.enabled || !pSamples || sampleCount == 0) return;
 
@@ -124,7 +129,6 @@ MMRESULT WINAPI HookedWaveOutWrite(HWAVEOUT hwo, LPWAVEHDR pwh, UINT cbwh) {
 typedef HRESULT (STDMETHODCALLTYPE *pfnReleaseBuffer)(IAudioRenderClient* pThis, UINT32 NumFramesWritten, DWORD dwFlags);
 pfnReleaseBuffer g_OriginalReleaseBuffer = nullptr;
 
-// Thread-local store to capture the buffer pointer obtained from GetBuffer
 thread_local BYTE* t_pAudioBuffer = nullptr;
 
 typedef HRESULT (STDMETHODCALLTYPE *pfnGetBuffer)(IAudioRenderClient* pThis, UINT32 NumFramesRequested, BYTE** ppData);
@@ -139,7 +143,7 @@ HRESULT STDMETHODCALLTYPE HookedGetBuffer(IAudioRenderClient* pThis, UINT32 NumF
 }
 
 HRESULT STDMETHODCALLTYPE HookedReleaseBuffer(IAudioRenderClient* pThis, UINT32 NumFramesWritten, DWORD dwFlags) {
-    if (t_pAudioBuffer && NumFramesWritten > 0 && !(dwFlags & AUDCLNT_BUFFEREMPTY_DATA)) {
+    if (t_pAudioBuffer && NumFramesWritten > 0 && !(dwFlags & AUDCLNT_BUFFERFLAGS_SILENT)) {
         // WASAPI defaults to 32-bit Float, 2-channel stereo in Wine
         DWORD sampleCount = NumFramesWritten * 2;
         ProcessPCMFloat(reinterpret_cast<float*>(t_pAudioBuffer), sampleCount);
@@ -162,7 +166,7 @@ void InitUniversalHooks() {
         }
     }
 
-    // Hook WASAPI via mmdevapi.dll / AudioClient
+    // Hook WASAPI via mmdevapi.dll
     HMODULE hMMDevApi = GetModuleHandleA("mmdevapi.dll");
     if (!hMMDevApi) hMMDevApi = LoadLibraryA("mmdevapi.dll");
 }

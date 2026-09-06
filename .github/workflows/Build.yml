@@ -1,0 +1,44 @@
+name: Build WineXInputAutoOverride
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Release Tag (e.g. v1.0.0)'
+        required: true
+        default: 'v1.0.0'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Install MinGW-w64 and Build Tools
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y gcc-mingw-w64-x86-64 g++-mingw-w64-x86-64 cmake ninja-build
+
+    - name: Configure CMake
+      run: |
+        cmake -B build64 \
+              -G "Ninja" \
+              -DCMAKE_SYSTEM_NAME=Windows \
+              -DCMAKE_C_COMPILER=x86_64-w64-mingw32-gcc \
+              -DCMAKE_CXX_COMPILER=x86_64-w64-mingw32-g++
+
+    - name: Build Plugin
+      run: cmake --build build64 --config Release
+
+    - name: Create GitHub Release
+      uses: softprops/action-gh-release@v2
+      with:
+        tag_name: ${{ github.event.inputs.release_tag }}
+        name: Release ${{ github.event.inputs.release_tag }}
+        draft: false
+        prerelease: false
+        files: build64/WineXInputAutoOverride.asi
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

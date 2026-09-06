@@ -1,4 +1,4 @@
-name: Build WineXInputAutoOverride
+name: Build BassBooster ASI
 
 on:
   workflow_dispatch:
@@ -39,6 +39,6 @@ jobs:
         name: Release ${{ github.event.inputs.release_tag }}
         draft: false
         prerelease: false
-        files: build64/WineXInputAutoOverride.asi
+        files: build64/BassBooster.asi
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

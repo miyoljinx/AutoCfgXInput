@@ -1,19 +1,17 @@
 #include <windows.h>
-#include <mmeapi.h>
 #include <dsound.h>
 #include <cmath>
 #include <fstream>
 #include <string>
+#include "MinHook.h"
 
-// Struct for DSP Settings
 struct Config {
     bool enabled = true;
-    float bassGainDb = 6.0f;
+    float bassGainDb = 10.0f;
     float cutoffFreq = 100.0f;
-    float masterVolume = 0.5f; // Set lower by default for immediate hearing test
+    float masterVolume = 0.2f; // Low volume for instant audio test
 } g_config;
 
-// BiQuad Low-Shelf Filter
 struct BiquadFilter {
     float b0, b1, b2, a1, a2;
     float x1[2] = {0}, x2[2] = {0};
@@ -73,10 +71,9 @@ void LoadOrGenerateConfig() {
     GetPrivateProfileStringA("BassBooster", "MasterVolume", "0.2", buffer, sizeof(buffer), iniPath.c_str());
     g_config.masterVolume = static_cast<float>(atof(buffer));
 
-    g_filter.SetupLowShelf(44100.0f, g_config.bassGainDb > 0.0f ? g_config.bassGainDb : 1.0f, g_config.bassGainDb);
+    g_filter.SetupLowShelf(44100.0f, g_config.cutoffFreq, g_config.bassGainDb);
 }
 
-// Function to process 16-bit PCM buffer directly in memory
 void ApplyDSP(void* pAudio, DWORD bytes) {
     if (!g_config.enabled || !pAudio || bytes == 0) return;
 
@@ -85,14 +82,9 @@ void ApplyDSP(void* pAudio, DWORD bytes) {
 
     for (DWORD i = 0; i < sampleCount; ++i) {
         float sampleFloat = static_cast<float>(pSamples[i]);
-        
-        // 1. Bass Boost
         float processed = g_filter.Process(sampleFloat, i % 2);
-        
-        // 2. Master Volume Adjuster
         processed *= g_config.masterVolume;
 
-        // Hard Limit Guard
         if (processed > 32767.0f) processed = 32767.0f;
         if (processed < -32768.0f) processed = -32768.0f;
 
@@ -100,40 +92,57 @@ void ApplyDSP(void* pAudio, DWORD bytes) {
     }
 }
 
-// VTable Interception for IDirectSoundBuffer::Unlock
+// Intercept Unlock Function
 typedef HRESULT (STDMETHODCALLTYPE *pfnUnlock)(IDirectSoundBuffer* pThis, LPVOID pvAudioPtr1, DWORD dwAudioBytes1, LPVOID pvAudioPtr2, DWORD dwAudioBytes2);
 pfnUnlock g_OriginalUnlock = nullptr;
 
 HRESULT STDMETHODCALLTYPE HookedUnlock(IDirectSoundBuffer* pThis, LPVOID pvAudioPtr1, DWORD dwAudioBytes1, LPVOID pvAudioPtr2, DWORD dwAudioBytes2) {
-    if (pvAudioPtr1 && dwAudioBytes1 > 0) {
-        ApplyDSP(pvAudioPtr1, dwAudioBytes1);
-    }
-    if (pvAudioPtr2 && dwAudioBytes2 > 0) {
-        ApplyDSP(pvAudioPtr2, dwAudioBytes2);
-    }
+    if (pvAudioPtr1 && dwAudioBytes1 > 0) ApplyDSP(pvAudioPtr1, dwAudioBytes1);
+    if (pvAudioPtr2 && dwAudioBytes2 > 0) ApplyDSP(pvAudioPtr2, dwAudioBytes2);
     return g_OriginalUnlock(pThis, pvAudioPtr1, dwAudioBytes1, pvAudioPtr2, dwAudioBytes2);
 }
 
-// Hook IDirectSoundBuffer VTable
-void HookBufferVTable(IDirectSoundBuffer* pBuffer) {
-    if (!pBuffer) return;
-    void** vtable = *reinterpret_cast<void***>(pBuffer);
-    
-    // Unlock is slot 19 in IDirectSoundBuffer VTable
-    if (vtable && vtable[19] != HookedUnlock) {
-        DWORD oldProtect;
-        VirtualProtect(&vtable[19], sizeof(void*), PAGE_EXECUTE_READWRITE, &oldProtect);
-        g_OriginalUnlock = reinterpret_cast<pfnUnlock>(vtable[19]);
-        vtable[19] = reinterpret_cast<void*>(HookedUnlock);
-        VirtualProtect(&vtable[19], sizeof(void*), PAGE_EXECUTE_READ, &oldProtect);
+// Hook DirectSoundCreate8
+typedef HRESULT (WINAPI *pfnDirectSoundCreate8)(LPCGUID pcGuidDevice, LPDIRECTSOUND8 *ppDS8, LPUNKNOWN pUnkOuter);
+pfnDirectSoundCreate8 g_OriginalDirectSoundCreate8 = nullptr;
+
+HRESULT WINAPI HookedDirectSoundCreate8(LPCGUID pcGuidDevice, LPDIRECTSOUND8 *ppDS8, LPUNKNOWN pUnkOuter) {
+    HRESULT hr = g_OriginalDirectSoundCreate8(pcGuidDevice, ppDS8, pUnkOuter);
+    if (SUCCEEDED(hr) && ppDS8 && *ppDS8) {
+        // Once DirectSound8 device is created, hook its buffer methods dynamically
+        IDirectSoundBuffer* pPrimaryBuffer = nullptr;
+        DSBUFFERDESC dsbd = { sizeof(DSBUFFERDESC), DSBCAPS_PRIMARYBUFFER, 0, 0, NULL };
+        if (SUCCEEDED((*ppDS8)->CreateSoundBuffer(&dsbd, &pPrimaryBuffer, NULL)) && pPrimaryBuffer) {
+            void** vtable = *reinterpret_cast<void***>(pPrimaryBuffer);
+            if (vtable && !g_OriginalUnlock) {
+                MH_CreateHook(vtable[19], (LPVOID)&HookedUnlock, (LPVOID*)&g_OriginalUnlock);
+                MH_EnableHook(vtable[19]);
+            }
+            pPrimaryBuffer->Release();
+        }
+    }
+    return hr;
+}
+
+void InitHooks() {
+    MH_Initialize();
+    HMODULE hDSound = GetModuleHandleA("dsound.dll");
+    if (!hDSound) hDSound = LoadLibraryA("dsound.dll");
+
+    if (hDSound) {
+        void* pDirectSoundCreate8 = (void*)GetProcAddress(hDSound, "DirectSoundCreate8");
+        if (pDirectSoundCreate8) {
+            MH_CreateHook(pDirectSoundCreate8, (LPVOID)&HookedDirectSoundCreate8, (LPVOID*)&g_OriginalDirectSoundCreate8);
+            MH_EnableHook(pDirectSoundCreate8);
+        }
     }
 }
 
-// DllMain Initialization
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved) {
     if (ul_reason_for_call == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(hModule);
         LoadOrGenerateConfig();
+        InitHooks();
     }
     return TRUE;
 }
